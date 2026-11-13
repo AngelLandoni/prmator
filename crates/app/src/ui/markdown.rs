@@ -14,6 +14,7 @@ use crate::github;
 use crate::theme::Theme;
 
 use super::components::code_line;
+use super::select::{selectable, Selectable};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MdSize {
@@ -48,12 +49,15 @@ enum Marker {
     Task(bool),
 }
 
-pub fn render_markdown(t: &Theme, text: &str) -> Div {
-    render(t, text, MdSize::Small, &id_for(text))
+/// `id` must be unique among the markdown shown at once (it keys link click state). The text
+/// can be selected with the mouse, on its own.
+pub fn render(t: &Theme, text: &str, size: MdSize, id: &str) -> Div {
+    render_in(t, text, size, id, id)
 }
 
-/// `id` must be unique among the markdown shown at once (it keys link click state).
-pub fn render(t: &Theme, text: &str, size: MdSize, id: &str) -> Div {
+/// Like [`render`], with a selection scope shared with other text (a mouse selection can run
+/// across everything in one scope).
+pub fn render_in(t: &Theme, text: &str, size: MdSize, id: &str, scope: &str) -> Div {
     let blocks = parse(text);
     let (text_size, gap) = match size {
         MdSize::Small => (rems(0.875), px(6.)),
@@ -66,20 +70,13 @@ pub fn render(t: &Theme, text: &str, size: MdSize, id: &str) -> Div {
         .text_size(text_size)
         .line_height(rems(1.5))
         .text_color(t.text)
-        .children(blocks.into_iter().enumerate().map(|(i, b)| render_block(t, b, &format!("{id}-{i}"), size)))
+        .children(blocks.into_iter().enumerate().map(|(i, b)| render_block(t, b, &format!("{id}-{i}"), size, scope)))
 }
 
-fn id_for(text: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    format!("md{:x}", h.finish())
-}
-
-fn render_block(t: &Theme, block: Block, id: &str, size: MdSize) -> gpui::AnyElement {
+fn render_block(t: &Theme, block: Block, id: &str, size: MdSize, scope: &str) -> gpui::AnyElement {
     match block {
         Block::Heading(level, text) => {
-            let el = div().font_weight(FontWeight::SEMIBOLD).line_height(rems(1.25)).child(inline(t, &text, t.text, id));
+            let el = div().font_weight(FontWeight::SEMIBOLD).line_height(rems(1.25)).child(inline(t, &text, t.text, id, scope));
             match (level, size) {
                 (1, MdSize::Normal) => el.text_size(rems(1.5)).pb_1().mt_2().border_b_1().border_color(t.border),
                 (2, MdSize::Normal) => el.text_size(rems(1.25)).pb_1().mt_2().border_b_1().border_color(t.border),
@@ -88,14 +85,14 @@ fn render_block(t: &Theme, block: Block, id: &str, size: MdSize) -> gpui::AnyEle
             }
             .into_any_element()
         }
-        Block::Para(text) => div().child(inline(t, &text, t.text, id)).into_any_element(),
-        Block::Code(lang, lines) => code_block(t, lang.as_deref(), &lines, id).into_any_element(),
+        Block::Para(text) => div().child(inline(t, &text, t.text, id, scope)).into_any_element(),
+        Block::Code(lang, lines) => code_block(t, lang.as_deref(), &lines, id, scope).into_any_element(),
         Block::Quote(text) => div()
             .pl_3()
             .border_l_4()
             .border_color(t.border_strong)
             .text_color(t.muted)
-            .child(render(t, &text, size, id).text_color(t.muted))
+            .child(render_in(t, &text, size, id, scope).text_color(t.muted))
             .into_any_element(),
         Block::Rule => div().h(px(2.)).my_1().bg(t.border).into_any_element(),
         Block::List(items) => div()
@@ -114,7 +111,7 @@ fn render_block(t: &Theme, block: Block, id: &str, size: MdSize) -> gpui::AnyEle
                     .gap_2()
                     .pl(px(item.depth as f32 * 20. + 4.))
                     .child(div().flex_none().min_w(px(16.)).flex().justify_end().text_color(color).child(marker))
-                    .child(div().flex_1().min_w_0().child(inline(t, &item.text, t.text, &format!("{id}-{i}"))))
+                    .child(div().flex_1().min_w_0().child(inline(t, &item.text, t.text, &format!("{id}-{i}"), scope)))
             }))
             .into_any_element(),
         Block::Table(header, rows) => {
@@ -131,7 +128,7 @@ fn render_block(t: &Theme, block: Block, id: &str, size: MdSize) -> gpui::AnyEle
                             .px_2()
                             .py_1()
                             .when(c > 0, |d| d.border_l_1().border_color(t.border))
-                            .child(inline(t, text, t.text, &format!("{key}-{c}")))
+                            .child(inline(t, text, t.text, &format!("{key}-{c}"), scope))
                     }))
             };
             div()
@@ -153,7 +150,9 @@ fn render_block(t: &Theme, block: Block, id: &str, size: MdSize) -> gpui::AnyEle
     }
 }
 
-fn code_block(t: &Theme, lang: Option<&str>, lines: &[String], id: &str) -> impl IntoElement {
+fn code_block(t: &Theme, lang: Option<&str>, lines: &[String], id: &str, scope: &str) -> impl IntoElement {
+    let scope = SharedString::from(scope.to_string());
+    let sel = t.accent.opacity(0.3);
     let lang = lang.and_then(prmator_syntax::Lang::from_name);
     let highlights = lang.map(|l| prmator_syntax::highlight(l, &lines.join("\n")));
     div()
@@ -175,7 +174,7 @@ fn code_block(t: &Theme, lang: Option<&str>, lines: &[String], id: &str) -> impl
             };
             let spans = highlights.as_ref().and_then(|h| h.get(i));
             let (_, styled) = code_line(t, if l.is_empty() { " " } else { l }, spans, None, t.code_bg);
-            div().whitespace_nowrap().text_color(diff_color.unwrap_or(t.text)).child(styled)
+            div().whitespace_nowrap().text_color(diff_color.unwrap_or(t.text)).child(selectable(scope.clone(), styled, sel))
         }))
 }
 
@@ -213,7 +212,8 @@ impl Inline {
 }
 
 /// Inline markdown as styled text; links are clickable.
-fn inline(t: &Theme, src: &str, color: Hsla, id: &str) -> gpui::AnyElement {
+fn inline(t: &Theme, src: &str, color: Hsla, id: &str, scope: &str) -> gpui::AnyElement {
+    let sel = t.accent.opacity(0.3);
     let mut out = Inline::default();
     parse_inline(src, Flags::default(), &mut out);
     let runs: Vec<TextRun> = out
@@ -244,17 +244,19 @@ fn inline(t: &Theme, src: &str, color: Hsla, id: &str) -> gpui::AnyElement {
         .collect();
     let styled = StyledText::new(SharedString::from(out.text.clone())).with_runs(runs);
     if link_ranges.is_empty() {
-        return styled.into_any_element();
+        return selectable(scope.to_string(), styled, sel).into_any_element();
     }
+    let layout = styled.layout().clone();
     let ranges: Vec<Range<usize>> = link_ranges.iter().map(|(r, _)| r.clone()).collect();
     let urls: Vec<String> = link_ranges.into_iter().map(|(_, u)| u).collect();
-    InteractiveText::new(SharedString::from(format!("{id}-links")), styled)
+    let links = InteractiveText::new(SharedString::from(format!("{id}-links")), styled)
         .on_click(ranges, move |ix, _, _| {
             if let Some(url) = urls.get(ix) {
                 github::open_in_browser(url);
             }
         })
-        .into_any_element()
+        .into_any_element();
+    Selectable::wrapping(scope.to_string(), layout, links, sel).into_any_element()
 }
 
 fn parse_inline(src: &str, flags: Flags, out: &mut Inline) {

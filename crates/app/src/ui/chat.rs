@@ -75,7 +75,7 @@ impl Prmator {
             .flex()
             .flex_col()
             .gap_4()
-            .children(conv.turns.iter().enumerate().map(|(i, turn)| render_turn(&t, id, i, turn, cx)));
+            .children(conv.turns.iter().enumerate().map(|(i, turn)| render_turn(&t, "chat", id, i, turn, cx)));
 
         let footer = div()
             .flex()

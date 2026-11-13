@@ -9,9 +9,10 @@ use gpui::{
 };
 
 use crate::analysis::SymbolChange;
-use crate::app::{symbol_at, CodeHit, Command, Prmator};
+use crate::app::{symbol_at, CodeHit, CodeView, Command, Prmator};
 use crate::diff::{FileStatus, Line, LineKind};
 use crate::model::{ExpandDir, Load, PrPage, PrView, Row, EXPAND_STEP};
+use crate::selection::Dir;
 use crate::store::DiffMode;
 use crate::theme::{theme, Theme};
 use crate::*;
@@ -69,6 +70,19 @@ impl Prmator {
                 }
             }))
             .on_action(cx.listener(|this, _: &PrevCommit, _, cx| this.prev_commit(cx)))
+            .on_action(cx.listener(|this, _: &ToggleFileView, window, cx| {
+                // At the selected line, else the current file.
+                let at = this.pr.as_ref().and_then(|pv| pv.selection).and_then(|(_, head)| this.diff_head_line(head));
+                this.open_browser(at, window, cx)
+            }))
+            .on_action(cx.listener(|this, _: &TokenLeft, _, cx| this.move_tokens(Dir::Left, false, cx)))
+            .on_action(cx.listener(|this, _: &TokenRight, _, cx| this.move_tokens(Dir::Right, false, cx)))
+            .on_action(cx.listener(|this, _: &TokenUp, _, cx| this.move_tokens(Dir::Up, false, cx)))
+            .on_action(cx.listener(|this, _: &TokenDown, _, cx| this.move_tokens(Dir::Down, false, cx)))
+            .on_action(cx.listener(|this, _: &ExtendLeft, _, cx| this.move_tokens(Dir::Left, true, cx)))
+            .on_action(cx.listener(|this, _: &ExtendRight, _, cx| this.move_tokens(Dir::Right, true, cx)))
+            .on_action(cx.listener(|this, _: &ExtendUp, _, cx| this.move_tokens(Dir::Up, true, cx)))
+            .on_action(cx.listener(|this, _: &ExtendDown, _, cx| this.move_tokens(Dir::Down, true, cx)))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
             .child(self.render_page_tabs(&t, pv, cx))
             .map(|d| match pv.page {
@@ -298,7 +312,7 @@ impl Prmator {
             Load::Ready(f) if f.is_empty() => return hint(t, "This PR has no changes.").into_any_element(),
             Load::Ready(_) => {}
         }
-        uniform_list(
+        let list = uniform_list(
             "diff",
             pv.rows.len(),
             cx.processor(|this, range: Range<usize>, _window, cx| {
@@ -307,16 +321,103 @@ impl Prmator {
             }),
         )
         .track_scroll(pv.scroll.clone())
-        .flex_1()
+        .size_full()
         .font_family(t.mono.clone())
-        .text_size(px(t.code_size))
-        .into_any_element()
+        .text_size(px(t.code_size));
+        div()
+            .relative()
+            .flex_1()
+            .min_h(px(0.))
+            .child(list)
+            // Where the find bar goes (it's drawn from the root, outside the diff's key
+            // context, so typing in it doesn't trigger the diff's one-letter shortcuts).
+            .when_some(self.find.as_ref().map(|f| f.anchor.clone()), |d, anchor| {
+                d.child(
+                    gpui::canvas(
+                        move |b, window, _| {
+                            if anchor.replace(Some(b)) != Some(b) {
+                                window.refresh();
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// ⌘F: floats over the top right of the code.
+    pub fn render_find_bar(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let t = &theme(cx).clone();
+        let f = self.find.as_ref()?;
+        let pv = self.pr.as_ref()?;
+        let shown = self.browser.is_none() && matches!(pv.page, PrPage::Files | PrPage::Story) && !pv.rows.is_empty();
+        let code = f.anchor.get().filter(|_| shown)?;
+        let status = f.status();
+        let none = !f.query.is_empty() && f.matches.is_empty();
+        let has = !f.matches.is_empty();
+        Some(
+            div()
+                .id("find-bar")
+                .key_context("FindBar")
+                .on_action(cx.listener(|this, _: &CloseFind, window, cx| this.close_find(window, cx)))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .absolute()
+                .top(code.top() + px(8.))
+                .left(code.right() - px(400. + 18.))
+                .w(px(400.))
+                .flex()
+                .items_center()
+                .gap_1()
+                .p_1()
+                .rounded_lg()
+                .bg(t.panel)
+                .border_1()
+                .border_color(t.border_strong)
+                .shadow_lg()
+                .font_family(t.ui_font.clone())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .rounded_md()
+                        .bg(t.input_bg)
+                        .border_1()
+                        .border_color(if none { t.del_fg } else { t.border })
+                        .child(f.input.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .min_w(px(72.))
+                        .px_1()
+                        .flex()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(if none { t.del_fg } else { t.muted })
+                        .child(SharedString::from(status)),
+                )
+                .child(
+                    ghost_button(t, "find-prev", "↑")
+                        .when(!has, |d| d.opacity(0.4))
+                        .on_click(cx.listener(|this, _, _, cx| this.find_step(-1, cx))),
+                )
+                .child(
+                    ghost_button(t, "find-next", "↓")
+                        .when(!has, |d| d.opacity(0.4))
+                        .on_click(cx.listener(|this, _, _, cx| this.find_step(1, cx))),
+                )
+                .child(ghost_button(t, "find-close", "✕").on_click(cx.listener(|this, _, window, cx| this.close_find(window, cx)))),
+        )
     }
 
     /// A diff row. `hits` is the code text on it, used to find the identifier under the
     /// mouse for hover cards and the right-click menu.
     fn row_base(&self, ix: usize, hits: Rc<Vec<CodeHit>>, cx: &mut Context<Self>) -> Stateful<Div> {
-        let hover_hits = hits.clone();
+        let (down_hits, move_hits) = (hits.clone(), hits.clone());
         let row_h = theme(cx).row_h;
         div()
             .id(("row", ix))
@@ -328,22 +429,24 @@ impl Prmator {
             .items_center()
             .whitespace_nowrap()
             .overflow_hidden()
-            .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev, window, cx| this.on_row_mouse_down(ix, ev, window, cx)))
+            .on_mouse_down(MouseButton::Left, cx.listener(move |this, ev, window, cx| {
+                this.on_code_mouse_down(CodeView::Diff, ix, ev, &down_hits, window, cx)
+            }))
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
-                this.on_row_mouse_move(ix, ev, cx);
-                this.on_code_hover(symbol_at(&hover_hits, ev.position), ev.position, cx);
+                this.on_code_mouse_move(CodeView::Diff, ix, ev, &move_hits, cx);
+                this.on_code_hover(symbol_at(&move_hits, ev.position), ev.position, cx);
             }))
             .on_mouse_up(MouseButton::Left, cx.listener(|this, _, _, _| this.dragging = false))
             .on_mouse_down(MouseButton::Right, cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                let symbol = symbol_at(&hits, ev.position).map(|(name, _)| name);
-                this.on_row_right_click(ix, ev, symbol, window, cx)
+                this.on_row_right_click(CodeView::Diff, ix, ev, &hits, window, cx)
             }))
     }
 
     fn render_row(&self, t: &Theme, ix: usize, cx: &mut Context<Self>) -> AnyElement {
         let Some(pv) = &self.pr else { return div().into_any_element() };
         let files = pv.files();
-        let selected = pv.selected_range().is_some_and(|r| r.contains(&ix));
+        // Whole rows show as selected unless tokens are (those are painted in the text).
+        let selected = pv.token_sel().is_none() && pv.selected_range().is_some_and(|r| r.contains(&ix));
         let no_hits = Rc::new(vec![]);
 
         match pv.rows[ix] {
@@ -393,6 +496,17 @@ impl Prmator {
                             })),
                     )
                     .child(div().text_xs().text_color(t.muted).child("Viewed"))
+                    .when(file.status != FileStatus::Deleted && !file.binary, |d| {
+                        d.child(
+                            ghost_button(t, ("view-file", fi), "📄 View file")
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    let path = this.pr.as_ref().map(|pv| pv.files()[fi].path.clone());
+                                    this.open_browser(path.map(|p| (p, 1)), window, cx)
+                                })),
+                        )
+                    })
                     .when(pv.can_expand(fi) && !collapsed, |d| {
                         let full = self.file_fully_expanded(fi);
                         d.child(
@@ -440,7 +554,7 @@ impl Prmator {
                 let line = &files[fi].hunks[hi].lines[li];
                 let (bg, gutter) = line_colors(t, line.kind, selected);
                 let (sign, sign_color) = sign(t, line.kind);
-                let (code, hit) = self.code_text(t, fi, hi, li, line);
+                let (code, hit) = self.code_text(t, ix, 0, fi, hi, li, line);
                 self.row_base(ix, Rc::new(vec![hit]), cx)
                     .when_some(bg, |d, bg| d.bg(bg))
                     .when(bg.is_none(), |d| d.hover(|s| s.bg(t.hover.opacity(0.5))))
@@ -584,7 +698,7 @@ impl Prmator {
                 let line = pv.context_line(fi, k, n);
                 match pv.mode {
                     DiffMode::Unified => {
-                        let (code, hit) = self.code_text(t, fi, usize::MAX, 0, &line);
+                        let (code, hit) = self.code_text(t, ix, 0, fi, usize::MAX, 0, &line);
                         self.row_base(ix, Rc::new(vec![hit]), cx)
                             .when(selected, |d| d.bg(t.selected))
                             .when(!selected, |d| d.hover(|s| s.bg(t.hover.opacity(0.5))))
@@ -596,8 +710,8 @@ impl Prmator {
                             .into_any_element()
                     }
                     DiffMode::Split => {
-                        let (left_code, left_hit) = self.code_text(t, fi, usize::MAX, 0, &line);
-                        let (right_code, right_hit) = self.code_text(t, fi, usize::MAX, 0, &line);
+                        let (left_code, left_hit) = self.code_text(t, ix, 0, fi, usize::MAX, 0, &line);
+                        let (right_code, right_hit) = self.code_text(t, ix, 1, fi, usize::MAX, 0, &line);
                         let half = |no: Option<u32>, code: Div| {
                             div()
                                 .flex_1()
@@ -631,7 +745,7 @@ impl Prmator {
                             let (bg, gutter) = line_colors(t, line.kind, selected);
                             let (sign, sign_color) = sign(t, line.kind);
                             let no = if side == 0 { line.old_no } else { line.new_no };
-                            let (code, hit) = self.code_text(t, fi, hi, li, line);
+                            let (code, hit) = self.code_text(t, ix, side, fi, hi, li, line);
                             hits.push(hit);
                             cell.when_some(bg, |d, bg| d.bg(bg))
                                 .child(line_number(t, no, gutter))
@@ -652,8 +766,10 @@ impl Prmator {
         }
     }
 
-    /// Syntax-colored code, plus what's needed to hit-test it later.
-    fn code_text(&self, t: &Theme, fi: usize, hi: usize, li: usize, line: &Line) -> (Div, CodeHit) {
+    /// Syntax-colored code, plus what's needed to hit-test it later. `ix` and `side` locate
+    /// it for the token selection.
+    #[allow(clippy::too_many_arguments)]
+    fn code_text(&self, t: &Theme, ix: usize, side: usize, fi: usize, hi: usize, li: usize, line: &Line) -> (Div, CodeHit) {
         let pv = self.pr.as_ref().unwrap();
         let analysis = pv.analysis.get(&fi);
         let spans = analysis.and_then(|a| match line.kind {
@@ -664,9 +780,46 @@ impl Prmator {
         let (display, styled, syntax) =
             code_line_with_spans(t, &line.text, spans, pv.emphasis.get(&(fi, hi, li)), emphasis_bg);
         let color = if line.kind == LineKind::Meta { t.dim } else { t.text };
-        let hit = CodeHit { layout: styled.layout().clone(), text: display, syntax };
-        (div().flex_1().min_w_0().overflow_hidden().text_color(color).child(styled), hit)
+        let shape = pv.token_sel().and_then(|s| s.shape_on(ix, side, |r| pv.row_text(r, side)));
+        let bubble = shape.map(|shape| selection_bubble(t, styled.layout().clone(), shape));
+        let found = self.find.as_ref().map(|f| f.ranges_on(ix, side, pv.rows[ix])).filter(|r| !r.is_empty());
+        let found = found.map(|ranges| find_highlights(t, styled.layout().clone(), &display, ranges));
+        let hit = CodeHit { layout: styled.layout().clone(), text: display, syntax, side };
+        // A little room on the left so a selection bubble at column 0 isn't clipped.
+        // Full height so the selection shape joins the rows above and below.
+        let code = div().relative().h_full().flex().items_center().flex_1().min_w_0().pl(px(3.)).overflow_hidden().text_color(color);
+        (code.children(found).children(bubble).child(styled), hit)
     }
+}
+
+/// Find matches painted behind a line of code; the current one stands out.
+fn find_highlights(t: &Theme, layout: gpui::TextLayout, text: &str, ranges: Vec<(Range<usize>, bool)>) -> impl IntoElement {
+    let col = |ix: usize| text.get(..ix).map_or(0, |s| s.chars().count());
+    let cols: Vec<(usize, usize, bool)> = ranges.into_iter().map(|(r, cur)| (col(r.start), col(r.end), cur)).collect();
+    let (other, current, border) = (t.warn.opacity(0.3), t.warn.opacity(0.75), t.warn);
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            // Code is monospace: a column is one character advance.
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let ts = window.text_system();
+            let cw = ts.advance(ts.resolve_font(&style.font()), font_size, 'm').map(|s| s.width).unwrap_or(font_size * 0.6);
+            let left = layout.bounds().left();
+            let pad = px(2.);
+            for &(a, b, cur) in &cols {
+                let rect = gpui::Bounds::from_corners(
+                    gpui::point(left + cw * a as f32, bounds.top() + pad),
+                    gpui::point(left + cw * b as f32, bounds.bottom() - pad),
+                );
+                let fill = if cur { current } else { other };
+                let edge = if cur { px(1.) } else { px(0.) };
+                window.paint_quad(gpui::quad(rect, px(3.), fill, edge, border, gpui::BorderStyle::Solid));
+            }
+        },
+    )
+    .absolute()
+    .size_full()
 }
 
 fn line_colors(t: &Theme, kind: LineKind, selected: bool) -> (Option<Hsla>, Option<Hsla>) {
@@ -689,7 +842,7 @@ fn sign(t: &Theme, kind: LineKind) -> (&'static str, Hsla) {
     }
 }
 
-fn line_number(t: &Theme, n: Option<u32>, gutter: Option<Hsla>) -> Div {
+pub(super) fn line_number(t: &Theme, n: Option<u32>, gutter: Option<Hsla>) -> Div {
     div()
         .w(px(t.line_no_width()))
         .h_full()
@@ -708,7 +861,7 @@ const SHORTCUTS: &[(&str, &str)] = &[
     ("⇧⌘O", "search symbols in the PR"),
     ("⌘P", "go to file / PR"),
     ("⇧⌘P", "commands"),
-    ("⌘F", "search the diff"),
+    ("⌘F", "find in the diff (↵ / ⇧↵ next / previous)"),
     ("c", "continue review (plan)"),
     ("] / [", "next / previous plan step"),
     ("j / k", "next / previous file"),

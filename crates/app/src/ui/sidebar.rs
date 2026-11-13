@@ -700,11 +700,11 @@ impl Prmator {
 }
 
 /// Left padding of a tree row at `depth`.
-fn tree_indent(depth: usize) -> f32 {
+pub(super) fn tree_indent(depth: usize) -> f32 {
     8. + depth as f32 * 14.
 }
 
-fn folder_icon(t: &Theme, open: bool) -> impl IntoElement {
+pub(super) fn folder_icon(t: &Theme, open: bool) -> impl IntoElement {
     let color = t.accent.opacity(if open { 0.6 } else { 0.45 });
     div()
         .flex_none()

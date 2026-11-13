@@ -40,6 +40,11 @@ impl Node {
 /// Rows to display for `paths` (indexed like the PR's files), skipping the contents of
 /// directories in `collapsed`.
 pub fn rows(paths: &[&str], collapsed: &HashSet<String>) -> Vec<TreeRow> {
+    rows_where(paths, &|dir| !collapsed.contains(dir))
+}
+
+/// Like [`rows`], showing a directory's contents only when `open(path)`.
+pub fn rows_where(paths: &[&str], open: &dyn Fn(&str) -> bool) -> Vec<TreeRow> {
     let mut root = Node::default();
     for (fi, path) in paths.iter().enumerate() {
         let mut parts: Vec<&str> = path.split('/').collect();
@@ -51,11 +56,11 @@ pub fn rows(paths: &[&str], collapsed: &HashSet<String>) -> Vec<TreeRow> {
         node.files.push((name.to_string(), fi));
     }
     let mut out = vec![];
-    flatten(&root, "", 0, collapsed, &mut out);
+    flatten(&root, "", 0, open, &mut out);
     out
 }
 
-fn flatten(node: &Node, prefix: &str, depth: usize, collapsed: &HashSet<String>, out: &mut Vec<TreeRow>) {
+fn flatten(node: &Node, prefix: &str, depth: usize, open: &dyn Fn(&str) -> bool, out: &mut Vec<TreeRow>) {
     let mut dirs: Vec<(&String, &Node)> = node.dirs.iter().collect();
     dirs.sort_by(|a, b| name_order(a.0, b.0));
     for (name, mut child) in dirs {
@@ -71,8 +76,8 @@ fn flatten(node: &Node, prefix: &str, depth: usize, collapsed: &HashSet<String>,
         child.all_files(&mut files);
         files.sort();
         out.push(TreeRow::Dir { path: path.clone(), name, depth, files });
-        if !collapsed.contains(&path) {
-            flatten(child, &path, depth + 1, collapsed, out);
+        if open(&path) {
+            flatten(child, &path, depth + 1, open, out);
         }
     }
     let mut files: Vec<&(String, usize)> = node.files.iter().collect();

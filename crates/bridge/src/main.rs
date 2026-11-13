@@ -115,8 +115,37 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Only the app may connect. Browsers send an `Origin` header with every WebSocket
+/// handshake, so any web page could otherwise reach us on localhost; the app sends none.
+/// With `PRMATOR_BRIDGE_TOKEN` set (the app always sets it), the URL must carry it too.
+#[allow(clippy::result_large_err)]
+fn check_handshake(
+    req: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    resp: tokio_tungstenite::tungstenite::handshake::server::Response,
+) -> Result<
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    let refuse = |why: &str| {
+        eprintln!("refused connection: {why}");
+        let mut r = tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some("forbidden".into()));
+        *r.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+        Err(r)
+    };
+    if req.headers().contains_key("origin") {
+        return refuse("from a web page");
+    }
+    if let Some(expected) = std::env::var("PRMATOR_BRIDGE_TOKEN").ok().filter(|t| !t.is_empty()) {
+        let given = req.uri().query().unwrap_or_default().split('&').find_map(|kv| kv.strip_prefix("token="));
+        if given != Some(expected.as_str()) {
+            return refuse("bad token");
+        }
+    }
+    Ok(resp)
+}
+
 async fn handle(stream: TcpStream, state: Shared) -> anyhow::Result<()> {
-    let ws = tokio_tungstenite::accept_async(stream).await?;
+    let ws = tokio_tungstenite::accept_hdr_async(stream, check_handshake).await?;
     let (mut sink, mut source) = ws.split();
 
     let (tx, mut rx) = unbounded_channel::<Msg>();
@@ -243,6 +272,10 @@ fn claude_bin() -> String {
 fn local_checkout(repo: &str) -> Option<PathBuf> {
     let base = PathBuf::from(std::env::var("PRMATOR_CODE_DIR").ok()?);
     let name = repo.rsplit('/').next()?;
+    // The repo name comes over the socket: keep it a plain directory name.
+    if name.is_empty() || name.starts_with('.') || name.contains('\\') {
+        return None;
+    }
     let dir = base.join(name);
     dir.join(".git").exists().then_some(dir)
 }

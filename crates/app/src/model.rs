@@ -11,6 +11,7 @@ use protocol::ChangeContext;
 use crate::analysis::FileAnalysis;
 use crate::diff::{FileDiff, FileStatus, Hunk, Line, LineKind};
 use crate::github::{PrDetail, PrSummary};
+use crate::selection::{display_text, TokenSel};
 use crate::store::{DiffMode, SavedPlan};
 
 const MAX_SNIPPET_LINES: usize = 800;
@@ -141,6 +142,9 @@ pub struct PrView {
     pub key: PrKey,
     pub summary: PrSummary,
     pub detail: Option<PrDetail>,
+    /// The head commit the loaded diff is from. Comments must use it: their line numbers
+    /// come from this diff, and `detail` may since have moved to a newer push.
+    pub diff_sha: Option<String>,
     pub files: Load<Vec<FileDiff>>,
     pub rows: Vec<Row>,
     pub mode: DiffMode,
@@ -148,6 +152,8 @@ pub struct PrView {
     pub viewed: HashSet<usize>,
     /// (anchor, head) row indices, always inside one file.
     pub selection: Option<(usize, usize)>,
+    /// Token-wise selection inside `selection`'s rows; see [`PrView::token_sel`].
+    pub tokens: Option<TokenSel>,
     pub current_file: usize,
     pub scroll: UniformListScrollHandle,
     pub analysis: HashMap<usize, FileAnalysis>,
@@ -184,12 +190,14 @@ impl PrView {
             key,
             summary,
             detail: None,
+            diff_sha: None,
             files: Load::Loading,
             rows: vec![],
             mode,
             collapsed: HashSet::new(),
             viewed: HashSet::new(),
             selection: None,
+            tokens: None,
             current_file: 0,
             scroll: UniformListScrollHandle::new(),
             analysis: HashMap::new(),
@@ -205,6 +213,11 @@ impl PrView {
             expanded: HashMap::new(),
             sources: HashMap::new(),
         }
+    }
+
+    /// The commit the diff shows (falls back to the PR head before the diff is in).
+    pub fn diff_sha(&self) -> Option<String> {
+        self.diff_sha.clone().or_else(|| self.detail.as_ref().map(|d| d.head_ref_oid.clone()))
     }
 
     pub fn files(&self) -> &[FileDiff] {
@@ -237,6 +250,7 @@ impl PrView {
             if let Some(focus) = &self.story_focus {
                 self.rows = self.insert_comment_rows(self.story_rows(focus));
                 self.selection = None;
+                self.tokens = None;
                 return;
             }
         }
@@ -264,6 +278,7 @@ impl PrView {
         }
         self.rows = self.insert_comment_rows(rows);
         self.selection = None;
+        self.tokens = None;
     }
 
     /// Rows for one virtual commit: only files it touches; its hunks in full, other
@@ -419,6 +434,34 @@ impl PrView {
         self.selection.map(|(a, b)| a.min(b)..a.max(b) + 1)
     }
 
+    /// The token selection, while it still matches the selected rows (anything that sets
+    /// `selection` directly, like rebuilding rows or jumping to a line, drops it).
+    pub fn token_sel(&self) -> Option<TokenSel> {
+        self.tokens.filter(|t| self.selection == Some((t.anchor.row, t.head.row)))
+    }
+
+    pub fn set_token_sel(&mut self, sel: TokenSel) {
+        self.selection = Some((sel.anchor.row, sel.head.row));
+        self.current_file = self.rows[sel.head.row].file();
+        self.tokens = Some(sel);
+    }
+
+    /// The code shown on one side of a row (0 = left/unified, 1 = right), tabs expanded.
+    /// `None` for rows without code there.
+    pub fn row_text(&self, row: usize, side: usize) -> Option<String> {
+        let files = self.files();
+        let line = |f: usize, h: usize, l: usize| {
+            let line = &files[f].hunks[h].lines[l];
+            (line.kind != LineKind::Meta).then(|| display_text(&line.text))
+        };
+        match *self.rows.get(row)? {
+            Row::Line(f, h, l) if side == 0 => line(f, h, l),
+            Row::Split(f, h, l, r) => line(f, h, if side == 0 { l? } else { r? }),
+            Row::Context(f, k, n) => Some(display_text(&self.context_line(f, k, n).text)),
+            _ => None,
+        }
+    }
+
     pub fn jump_to_file(&mut self, fi: usize) {
         self.show_files_page();
         self.scroll_to_file(fi);
@@ -468,6 +511,7 @@ impl PrView {
                 // Show a little context above the target.
                 self.scroll.scroll_to_item(row.saturating_sub(3), ScrollStrategy::Top);
                 self.selection = Some((row, row));
+                self.tokens = None;
                 true
             }
             None => {

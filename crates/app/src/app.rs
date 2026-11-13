@@ -7,11 +7,13 @@ use std::time::Duration;
 use gpui::{
     SharedString, TextLayout,
     ClipboardItem, Context, Entity, FocusHandle, MouseButton, MouseDownEvent, MouseMoveEvent, Pixels,
-    Point, ScrollHandle, ScrollStrategy, Task, Window,
+    Point, ScrollHandle, ScrollStrategy, Task, UniformListScrollHandle, Window,
 };
 use protocol::{ChangeContext, Msg};
 
 use crate::analysis::{self, FileAnalysis, Revisions, Spans};
+use crate::browser::{FileBrowser, SourceFile};
+use crate::selection::{Caret, Dir, TokenSel};
 use prmator_syntax::Highlight;
 use crate::defs::{self, Definition, KnownFile};
 use crate::diff;
@@ -35,10 +37,24 @@ const HOVER_HIDE_DELAY: Duration = Duration::from_millis(250);
 pub struct Menu {
     pub position: Point<Pixels>,
     pub context: ChangeContext,
+    /// Which code view was right-clicked.
+    pub view: CodeView,
     /// The diff row right-clicked, for "Add comment".
     pub row: Option<usize>,
     /// Identifier under the mouse, when the right-click landed on one.
     pub symbol: Option<String>,
+    /// The token selection's text, for "Copy selection".
+    pub selected_text: Option<String>,
+    /// The code's place in the head version (path, line), for "Open in file view".
+    pub open_at: Option<(String, u32)>,
+}
+
+/// The two code views that support token selection and the right-click menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodeView {
+    Diff,
+    /// The full-file view.
+    Source,
 }
 
 /// Code text rendered on a diff row, kept so mouse positions can be mapped to characters.
@@ -48,6 +64,18 @@ pub struct CodeHit {
     pub text: SharedString,
     /// Syntax spans in display offsets.
     pub syntax: Spans,
+    /// 0 = left (or unified), 1 = right side of a split row.
+    pub side: usize,
+}
+
+/// Where `position` falls in a row's code: (side, byte index in the display text). `side`
+/// restricts it to one side; otherwise `None` over the gutter (left of the code).
+pub fn text_index_at(hits: &[CodeHit], position: Point<Pixels>, side: Option<usize>) -> Option<(usize, usize)> {
+    hits.iter()
+        .filter(|h| side.is_none_or(|s| h.side == s))
+        .filter(|h| side.is_some() || h.layout.bounds().left() <= position.x)
+        .max_by(|a, b| a.layout.bounds().left().partial_cmp(&b.layout.bounds().left()).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|h| (h.side, h.layout.index_for_position(position).unwrap_or_else(|i| i)))
 }
 
 /// The identifier under `position` on a row, if any, with its syntax highlight.
@@ -65,6 +93,14 @@ pub const QUICK_ASKS: &[(&str, &str)] = &[
     ("Find bugs & risks", "Review this change for bugs, edge cases and risks. Be specific and cite lines."),
     ("Suggest a simpler version", "Could this be simpler or more idiomatic? Show the improved code."),
     ("What could this break?", "What other code or behavior could this change break? What should I verify?"),
+];
+
+/// Quick questions about code in the full-file view (not a change).
+pub const QUICK_ASKS_SOURCE: &[(&str, &str)] = &[
+    ("Explain this code", "Explain what this code does and how it fits into the rest of the codebase."),
+    ("How does the PR affect it?", "Does this PR change or affect this code (directly or through what it calls)? How?"),
+    ("Find bugs & risks", "Review this code for bugs, edge cases and risks. Be specific and cite lines."),
+    ("Where is it used?", "Where and how is this code used in the repo? Use `gh` or search the code to find out."),
 ];
 
 pub enum DefState {
@@ -103,6 +139,7 @@ pub enum Command {
     OpenOnGitHub,
     AskAboutPr,
     ReviewAsStory,
+    OpenFileView,
     BackToList,
 }
 
@@ -129,6 +166,7 @@ impl Command {
         Command::OpenOnGitHub,
         Command::AskAboutPr,
         Command::ReviewAsStory,
+        Command::OpenFileView,
         Command::BackToList,
     ];
 
@@ -155,6 +193,7 @@ impl Command {
             Command::OpenOnGitHub => "Open PR on GitHub",
             Command::AskAboutPr => "Ask Claude about the PR…",
             Command::ReviewAsStory => "Review as a story (virtual commits)",
+            Command::OpenFileView => "Open file view (full files + project tree)",
             Command::BackToList => "Back to pull requests",
         }
     }
@@ -168,6 +207,7 @@ impl Command {
             Command::MarkViewed => "v",
             Command::NextFile => "j",
             Command::PrevFile => "k",
+            Command::OpenFileView => "f",
             Command::Refresh => "⌘R",
             Command::BackToList => "⌘[",
             _ => "",
@@ -199,6 +239,10 @@ pub struct Prmator {
     /// All open PRs of the repos in the lists, to complete stacks: repo -> PRs.
     pub open_prs: HashMap<String, Load<Vec<PrSummary>>>,
     pub pr: Option<PrView>,
+    /// The full-file view, when open (it replaces the file list and the diff).
+    pub browser: Option<FileBrowser>,
+    /// The last closed file view, reopened as it was.
+    browser_cache: Option<FileBrowser>,
     /// Conversations per PR, kept while switching between PRs.
     /// Claude conversations per PR (open chat + review log).
     pub conversations: HashMap<PrKey, Vec<Conversation>>,
@@ -209,6 +253,8 @@ pub struct Prmator {
     pub next_id: u64,
     pub menu: Option<Menu>,
     pub palette: Option<Palette>,
+    /// ⌘F find bar over the diff.
+    pub find: Option<crate::find::FindBar>,
     pub hover: Option<HoverCard>,
     hover_task: Option<Task<()>>,
     /// Identifier waiting for the hover delay.
@@ -283,12 +329,15 @@ impl Prmator {
             prs: HashMap::new(),
             open_prs: HashMap::new(),
             pr: None,
+            browser: None,
+            browser_cache: None,
             conversations: HashMap::new(),
             requests: HashMap::new(),
             chat: None,
             next_id: 1,
             menu: None,
             palette: None,
+            find: None,
             hover: None,
             hover_task: None,
             hover_pending: None,
@@ -501,6 +550,8 @@ impl Prmator {
             pv.left_tab = LeftTab::Plan;
         }
         self.pr = Some(pv);
+        self.browser = None;
+        self.browser_cache = None;
         self.menu = None;
         self.hover = None;
         window.focus(&self.diff_focus);
@@ -513,9 +564,26 @@ impl Prmator {
         let detail = cx.background_executor().spawn({
             let repo = repo.clone();
             async move {
-                let detail = github::pr_detail(&repo, number)?;
-                let base = github::merge_base(&repo, &detail.base_ref_oid, &detail.head_ref_oid).ok();
-                anyhow::Ok((detail, base))
+                // Detail, then the diff, then detail again: if the PR was pushed to in
+                // between, the diff may not match the head, so go again. Comments are
+                // anchored to lines of this diff at this head.
+                let mut detail = github::pr_detail(&repo, number);
+                let mut diff = github::pr_diff(&repo, number);
+                for _ in 0..2 {
+                    let Ok(before) = &detail else { break };
+                    let Ok(after) = github::pr_detail(&repo, number) else { break };
+                    let moved = after.head_ref_oid != before.head_ref_oid;
+                    detail = Ok(after);
+                    if !moved {
+                        break;
+                    }
+                    diff = github::pr_diff(&repo, number);
+                }
+                let detail = detail.map(|d| {
+                    let base = github::merge_base(&repo, &d.base_ref_oid, &d.head_ref_oid).ok();
+                    (d, base)
+                });
+                (detail, diff.map(|text| diff::parse(&text)))
             }
         });
         let comments = cx.background_executor().spawn({
@@ -538,11 +606,8 @@ impl Prmator {
             }
         })
         .detach();
-        let diff = cx
-            .background_executor()
-            .spawn(async move { github::pr_diff(&repo, number).map(|text| diff::parse(&text)) });
         cx.spawn(async move |this, cx| {
-            let (detail, files) = (detail.await, diff.await);
+            let (detail, files) = detail.await;
             let _ = this.update(cx, |this, cx| {
                 let viewed_paths = this.store.progress(&key.store_key()).viewed.clone();
                 let Some(pv) = this.pr.as_mut().filter(|pv| pv.key == key) else { return };
@@ -552,6 +617,7 @@ impl Prmator {
                     pv.summary.author = d.author.clone();
                     pv.summary.url = d.url.clone();
                     merge_base = base.or_else(|| Some(d.base_ref_oid.clone()));
+                    pv.diff_sha = Some(d.head_ref_oid.clone());
                     pv.detail = Some(d);
                 }
                 match files {
@@ -635,6 +701,7 @@ impl Prmator {
                 pv.files = Load::Loading;
                 pv.rows.clear();
                 pv.selection = None;
+                pv.tokens = None;
                 pv.analysis.clear();
                 let key = pv.key.clone();
                 self.fetch_pr(key, cx);
@@ -699,6 +766,8 @@ impl Prmator {
     pub fn back_to_list(&mut self, _: &BackToList, window: &mut Window, cx: &mut Context<Self>) {
         self.finish_chat(window, cx);
         self.pr = None;
+        self.browser = None;
+        self.browser_cache = None;
         self.menu = None;
         self.hover = None;
         window.focus(&self.root_focus);
@@ -799,7 +868,7 @@ impl Prmator {
         if pv.sources.contains_key(&fi) {
             return;
         }
-        let Some(sha) = pv.detail.as_ref().map(|d| d.head_ref_oid.clone()) else { return };
+        let Some(sha) = pv.diff_sha() else { return };
         pv.sources.insert(fi, Load::Loading);
         let (key, repo, path) = (pv.key.clone(), pv.key.repo.clone(), pv.files()[fi].path.clone());
         let task = cx.background_executor().spawn(async move { github::file_content(&repo, &sha, &path) });
@@ -870,25 +939,136 @@ impl Prmator {
         cx.notify();
     }
 
-    fn select_row(&mut self, ix: usize, extend: bool) {
-        let Some(pv) = &mut self.pr else { return };
-        let Some(row) = pv.rows.get(ix).copied() else { return };
-        pv.current_file = row.file();
-        match pv.selection {
-            Some((anchor, _)) if extend && pv.rows[anchor].file() == row.file() => pv.selection = Some((anchor, ix)),
-            _ => pv.selection = Some((ix, ix)),
+    // ---- selection (whole lines from the gutter, tokens in the code)
+
+    /// The code view the keyboard acts on: the file view when open, else the diff.
+    pub fn active_view(&self) -> CodeView {
+        if self.browser.is_some() { CodeView::Source } else { CodeView::Diff }
+    }
+
+    pub fn view_text(&self, view: CodeView, row: usize, side: usize) -> Option<String> {
+        match view {
+            CodeView::Diff => self.pr.as_ref()?.row_text(row, side),
+            CodeView::Source => self.browser.as_ref()?.row_text(row, side),
         }
     }
 
-    pub fn on_row_mouse_down(&mut self, ix: usize, ev: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    fn view_rows(&self, view: CodeView) -> usize {
+        match view {
+            CodeView::Diff => self.pr.as_ref().map_or(0, |pv| pv.rows.len()),
+            CodeView::Source => self.browser.as_ref().map_or(0, |b| b.line_count()),
+        }
+    }
+
+    pub fn view_token_sel(&self, view: CodeView) -> Option<TokenSel> {
+        match view {
+            CodeView::Diff => self.pr.as_ref()?.token_sel(),
+            CodeView::Source => self.browser.as_ref()?.token_sel(),
+        }
+    }
+
+    fn view_selection(&self, view: CodeView) -> Option<(usize, usize)> {
+        match view {
+            CodeView::Diff => self.pr.as_ref()?.selection,
+            CodeView::Source => self.browser.as_ref()?.selection,
+        }
+    }
+
+    fn set_view_tokens(&mut self, view: CodeView, sel: TokenSel) {
+        match view {
+            CodeView::Diff => {
+                if let Some(pv) = &mut self.pr {
+                    pv.set_token_sel(sel)
+                }
+            }
+            CodeView::Source => {
+                if let Some(b) = &mut self.browser {
+                    b.set_token_sel(sel)
+                }
+            }
+        }
+    }
+
+    fn view_scroll(&self, view: CodeView) -> Option<UniformListScrollHandle> {
+        match view {
+            CodeView::Diff => Some(self.pr.as_ref()?.scroll.clone()),
+            CodeView::Source => Some(self.browser.as_ref()?.scroll.clone()),
+        }
+    }
+
+    /// Whether a selection may span rows `a` and `b` (in the diff: only within one file).
+    fn same_group(&self, view: CodeView, a: usize, b: usize) -> bool {
+        match (view, &self.pr) {
+            (CodeView::Diff, Some(pv)) => pv.rows.get(a).map(|r| r.file()) == pv.rows.get(b).map(|r| r.file()),
+            _ => true,
+        }
+    }
+
+    /// Selects whole rows (clicks on the gutter, or rows without code).
+    fn select_row(&mut self, view: CodeView, ix: usize, extend: bool) {
+        let anchor = self.view_selection(view).map(|(a, _)| a).filter(|&a| extend && self.same_group(view, a, ix));
+        let selection = Some((anchor.unwrap_or(ix), ix));
+        match view {
+            CodeView::Diff => {
+                let Some(pv) = &mut self.pr else { return };
+                let Some(row) = pv.rows.get(ix).copied() else { return };
+                pv.current_file = row.file();
+                pv.selection = selection;
+                pv.tokens = None;
+            }
+            CodeView::Source => {
+                let Some(b) = &mut self.browser else { return };
+                b.selection = selection;
+                b.tokens = None;
+            }
+        }
+    }
+
+    /// The token under `position` on row `ix` (optionally only on one side).
+    fn caret_at(&self, view: CodeView, ix: usize, hits: &[CodeHit], position: Point<Pixels>, side: Option<usize>) -> Option<Caret> {
+        let (side, i) = text_index_at(hits, position, side)?;
+        let text = self.view_text(view, ix, side)?;
+        Some(Caret::new(ix, side, crate::selection::token_at(&text, i)?))
+    }
+
+    /// Mouse down on a code row: selects the token under the mouse (⇧ extends, a double
+    /// click takes the whole line), or the whole row from the gutter.
+    pub fn on_code_mouse_down(
+        &mut self,
+        view: CodeView,
+        ix: usize,
+        ev: &MouseDownEvent,
+        hits: &[CodeHit],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(&self.diff_focus);
         self.menu = None;
-        self.select_row(ix, ev.modifiers.shift);
         self.dragging = true;
+        match self.caret_at(view, ix, hits, ev.position, None) {
+            Some(caret) if ev.click_count >= 2 => {
+                let tokens = self.view_text(view, ix, caret.side).map(|t| crate::selection::tokens(&t)).unwrap_or_default();
+                if let (Some(first), Some(last)) = (tokens.first(), tokens.last()) {
+                    let sel = TokenSel { anchor: Caret::new(ix, caret.side, first.clone()), head: Caret::new(ix, caret.side, last.clone()) };
+                    self.set_view_tokens(view, sel);
+                }
+            }
+            Some(caret) => {
+                let sel = match self.view_token_sel(view) {
+                    Some(s) if ev.modifiers.shift && s.side() == caret.side && self.same_group(view, s.anchor.row, ix) => {
+                        TokenSel { anchor: s.anchor, head: caret }
+                    }
+                    _ => TokenSel::single(caret),
+                };
+                self.set_view_tokens(view, sel);
+            }
+            None => self.select_row(view, ix, ev.modifiers.shift),
+        }
         cx.notify();
     }
 
-    pub fn on_row_mouse_move(&mut self, ix: usize, ev: &MouseMoveEvent, cx: &mut Context<Self>) {
+    /// Dragging extends the selection token by token (or row by row from the gutter).
+    pub fn on_code_mouse_move(&mut self, view: CodeView, ix: usize, ev: &MouseMoveEvent, hits: &[CodeHit], cx: &mut Context<Self>) {
         if !self.dragging {
             return;
         }
@@ -896,18 +1076,82 @@ impl Prmator {
             self.dragging = false;
             return;
         }
-        let Some(pv) = &self.pr else { return };
-        if pv.selection.is_some_and(|(_, head)| head != ix) {
-            self.select_row(ix, true);
-            cx.notify();
+        match self.view_token_sel(view) {
+            Some(sel) => {
+                let Some(head) = self.caret_at(view, ix, hits, ev.position, Some(sel.side())) else { return };
+                if head != sel.head && self.same_group(view, sel.anchor.row, ix) {
+                    self.set_view_tokens(view, TokenSel { anchor: sel.anchor, head });
+                    cx.notify();
+                }
+            }
+            None => {
+                if self.view_selection(view).is_some_and(|(_, head)| head != ix) {
+                    self.select_row(view, ix, true);
+                    cx.notify();
+                }
+            }
         }
+    }
+
+    /// Arrow keys: move to the next token (⇧ extends the selection).
+    pub fn move_tokens(&mut self, dir: Dir, extend: bool, cx: &mut Context<Self>) {
+        let view = self.active_view();
+        if view == CodeView::Diff && self.pr.as_ref().is_none_or(|pv| pv.page == PrPage::Conversation) {
+            return;
+        }
+        let rows = self.view_rows(view);
+        let Some(scroll) = self.view_scroll(view) else { return };
+        let Some(sel) = self.view_token_sel(view) else {
+            // No token selected yet: start at the selected line, or the top of the view.
+            let from = self.view_selection(view).map_or_else(|| scroll.0.borrow().base_handle.logical_scroll_top().0, |(_, head)| head);
+            let first = (from..rows).find_map(|r| {
+                let text = self.view_text(view, r, 0)?;
+                Some(Caret::new(r, 0, crate::selection::tokens(&text).first()?.clone()))
+            });
+            if let Some(caret) = first {
+                self.set_view_tokens(view, TokenSel::single(caret));
+                scroll.scroll_to_item(caret.row, ScrollStrategy::Center);
+                cx.notify();
+            }
+            return;
+        };
+        let Some(next) = crate::selection::step(sel.head, dir, rows, |r, s| self.view_text(view, r, s)) else { return };
+        if extend && !self.same_group(view, sel.anchor.row, next.row) {
+            return;
+        }
+        self.set_view_tokens(view, if extend { TokenSel { anchor: sel.anchor, head: next } } else { TokenSel::single(next) });
+        scroll.scroll_to_item(next.row, if next.row < sel.head.row { ScrollStrategy::Top } else { ScrollStrategy::Bottom });
+        cx.notify();
+    }
+
+    /// The selected text, when tokens are selected.
+    pub fn selected_text(&self, view: CodeView) -> Option<String> {
+        let sel = self.view_token_sel(view)?;
+        Some(sel.text(|r, s| self.view_text(view, r, s))).filter(|t| !t.is_empty())
+    }
+
+    /// Context for Claude about the selection in a view: the selected lines, and the
+    /// selected text in the location when tokens are selected.
+    pub fn selection_context(&self, view: CodeView) -> Option<ChangeContext> {
+        let mut context = match view {
+            CodeView::Diff => {
+                let pv = self.pr.as_ref()?;
+                pv.rows_context(pv.selected_range()?)?
+            }
+            CodeView::Source => self.source_context()?,
+        };
+        if let Some(text) = self.selected_text(view).filter(|t| !t.contains('\n') && t.chars().count() <= 60) {
+            context.location = format!("{} · `{text}`", context.location);
+        }
+        Some(context)
     }
 
     pub fn on_row_right_click(
         &mut self,
+        view: CodeView,
         ix: usize,
         ev: &MouseDownEvent,
-        symbol: Option<String>,
+        hits: &[CodeHit],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -915,32 +1159,86 @@ impl Prmator {
         self.hover = None;
         self.hover_pending = None;
         self.hover_task = None;
-        let Some(pv) = &mut self.pr else { return };
-        let Some(row) = pv.rows.get(ix).copied() else { return };
-        let context = match row {
-            Row::File(fi) | Row::Note(fi) => Some(pv.file_context(fi)),
-            Row::Hunk(..) => {
-                let rows = pv.hunk_rows(ix);
-                pv.selection = Some((rows.start, rows.end - 1));
-                pv.rows_context(rows)
+        // Like an editor: right-clicking outside the selection selects what's under the mouse.
+        let inside = self.view_token_sel(view).is_some_and(|s| {
+            text_index_at(hits, ev.position, Some(s.side())).is_some_and(|(side, i)| s.contains(ix, side, i))
+        }) || (self.view_token_sel(view).is_none()
+            && self.view_selection(view).is_some_and(|(a, b)| (a.min(b)..=a.max(b)).contains(&ix)));
+        if !inside {
+            match self.caret_at(view, ix, hits, ev.position, None) {
+                Some(caret) => self.set_view_tokens(view, TokenSel::single(caret)),
+                None => self.select_row(view, ix, false),
             }
-            Row::Expand(..) | Row::Elsewhere(..) | Row::Comments(..) => None,
-            Row::Line(..) | Row::Split(..) | Row::Context(..) => {
-                if !pv.selected_range().is_some_and(|r| r.contains(&ix)) {
-                    pv.selection = Some((ix, ix));
-                }
-                pv.selected_range().and_then(|r| pv.rows_context(r))
+        }
+        let symbol = symbol_at(hits, ev.position)
+            .map(|(name, _)| name)
+            .filter(|s| s.len() > 1 && !s.chars().all(|c| c.is_ascii_digit()));
+        let selected_text = self.selected_text(view);
+        let menu = match view {
+            CodeView::Source => self.source_context().map(|context| Menu {
+                position: ev.position,
+                context,
+                view,
+                row: None,
+                symbol,
+                selected_text,
+                open_at: None,
+            }),
+            CodeView::Diff => {
+                let Some(pv) = &mut self.pr else { return };
+                let Some(row) = pv.rows.get(ix).copied() else { return };
+                let context = match row {
+                    Row::File(fi) | Row::Note(fi) => Some(pv.file_context(fi)),
+                    Row::Hunk(..) => {
+                        let rows = pv.hunk_rows(ix);
+                        pv.selection = Some((rows.start, rows.end - 1));
+                        pv.tokens = None;
+                        pv.rows_context(rows)
+                    }
+                    Row::Expand(..) | Row::Elsewhere(..) | Row::Comments(..) => None,
+                    Row::Line(..) | Row::Split(..) | Row::Context(..) => self.selection_context(view),
+                };
+                let open_at = self.diff_head_line(ix);
+                let commentable = matches!(row, Row::Line(..) | Row::Split(..)).then_some(ix);
+                context.map(|context| Menu {
+                    position: ev.position,
+                    context,
+                    view,
+                    row: commentable,
+                    symbol,
+                    selected_text: selected_text.filter(|_| matches!(row, Row::Line(..) | Row::Split(..) | Row::Context(..))),
+                    open_at,
+                })
             }
         };
-        let symbol = symbol.filter(|s| s.len() > 1 && !s.chars().all(|c| c.is_ascii_digit()));
-        let commentable = matches!(row, Row::Line(..) | Row::Split(..)).then_some(ix);
-        self.menu = context.map(|context| Menu { position: ev.position, context, symbol, row: commentable });
+        self.menu = menu;
         cx.notify();
     }
 
+    /// Where a diff row is in the head version: (path, line). The file's first line for its
+    /// header, the next head line for removed lines; `None` for deleted files.
+    pub fn diff_head_line(&self, ix: usize) -> Option<(String, u32)> {
+        let pv = self.pr.as_ref()?;
+        let row = *pv.rows.get(ix)?;
+        let file = &pv.files()[row.file()];
+        if file.status == crate::diff::FileStatus::Deleted || file.binary {
+            return None;
+        }
+        let line = match row {
+            Row::Line(f, h, l) | Row::Split(f, h, Some(l), None) => {
+                let lines = &pv.files()[f].hunks[h].lines;
+                lines[l..].iter().find_map(|l| l.new_no).or_else(|| lines[..l].iter().rev().find_map(|l| l.new_no))
+            }
+            Row::Split(f, h, _, Some(r)) => pv.files()[f].hunks[h].lines[r].new_no,
+            Row::Hunk(f, h) => Some(pv.files()[f].hunks[h].before().1 + 1),
+            Row::Context(_, _, n) => Some(n),
+            _ => None,
+        };
+        Some((file.path.clone(), line.unwrap_or(1)))
+    }
+
     pub fn ask_selection(&mut self, _: &AskSelection, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(pv) = &self.pr else { return };
-        if let Some(ctx) = pv.selected_range().and_then(|r| pv.rows_context(r)) {
+        if let Some(ctx) = self.selection_context(self.active_view()) {
             self.open_chat(Some(ctx), window.mouse_position(), None, window, cx);
         }
     }
@@ -950,18 +1248,179 @@ impl Prmator {
             return self.finish_chat(window, cx);
         }
         if self.hover.take().is_none() && self.menu.take().is_none() {
-            if let Some(pv) = &mut self.pr {
+            if let Some(b) = &mut self.browser {
+                // Esc clears the selection, then closes the file view.
+                if b.selection.take().is_none() {
+                    self.close_browser(window, cx);
+                }
+            } else if let Some(pv) = &mut self.pr {
                 pv.selection = None;
+                pv.tokens = None;
             }
         }
         cx.notify();
     }
 
+    /// ⌘C: the selected text (tokens), else the selected lines.
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
-        let Some(pv) = &self.pr else { return };
-        if let Some(ctx) = pv.selected_range().and_then(|r| pv.rows_context(r)) {
-            cx.write_to_clipboard(ClipboardItem::new_string(ctx.snippet));
+        // Text selected with the mouse (chat, review log, comments) wins.
+        if crate::ui::select::copy(cx) {
+            return;
         }
+        let view = self.active_view();
+        let text = self.selected_text(view).or_else(|| match view {
+            CodeView::Diff => {
+                let pv = self.pr.as_ref()?;
+                Some(pv.rows_context(pv.selected_range()?)?.snippet)
+            }
+            CodeView::Source => {
+                let b = self.browser.as_ref()?;
+                let file = b.current()?;
+                let range = b.selected_range()?;
+                Some(file.lines.get(range.start..range.end.min(file.lines.len()))?.join("\n"))
+            }
+        });
+        if let Some(text) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    // ---- file view
+
+    /// Opens the full-file view (at `path` and line, when given). It shows the PR's head.
+    pub fn open_browser(&mut self, at: Option<(String, u32)>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pv) = &self.pr else { return };
+        let Some(sha) = pv.detail.as_ref().map(|d| d.head_ref_oid.clone()) else { return };
+        if self.browser.is_none() {
+            let cached = self.browser_cache.take().filter(|b| b.key == pv.key && b.sha == sha);
+            let fresh = cached.is_none();
+            let changed = pv.files().iter().map(|f| (f.path.clone(), f.status)).collect();
+            self.browser = Some(cached.unwrap_or_else(|| FileBrowser::new(pv.key.clone(), sha, changed)));
+            if fresh {
+                self.load_tree(cx);
+            }
+        }
+        self.menu = None;
+        self.hover = None;
+        window.focus(&self.diff_focus);
+        let at = at.or_else(|| {
+            // Default to the current file of the diff.
+            let b = self.browser.as_ref()?;
+            if b.path.is_some() {
+                return None;
+            }
+            let pv = self.pr.as_ref()?;
+            let file = pv.files().get(pv.current_file)?;
+            (file.status != crate::diff::FileStatus::Deleted).then(|| (file.path.clone(), 1))
+        });
+        if let Some((path, line)) = at {
+            self.browser_open_file(path, Some(line), cx);
+        }
+        cx.notify();
+    }
+
+    pub fn close_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.browser_cache = self.browser.take();
+        self.menu = None;
+        self.hover = None;
+        window.focus(&self.diff_focus);
+        cx.notify();
+    }
+
+    fn load_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(b) = &self.browser else { return };
+        let (key, repo, sha) = (b.key.clone(), b.key.repo.clone(), b.sha.clone());
+        let task = cx.background_executor().spawn(async move { github::repo_tree(&repo, &sha) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(b) = this.browser.as_mut().filter(|b| b.key == key) else { return };
+                match result {
+                    Ok((paths, truncated)) => {
+                        b.set_tree(paths, truncated);
+                        if let Some(path) = b.path.clone() {
+                            b.reveal(&path);
+                        }
+                    }
+                    Err(e) => b.tree = Load::Failed(format!("{e:#}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Shows a file in the file view, loading it first if needed.
+    pub fn browser_open_file(&mut self, path: String, line: Option<u32>, cx: &mut Context<Self>) {
+        let Some(pv) = &self.pr else { return };
+        let Some(b) = &mut self.browser else { return };
+        b.path = Some(path.clone());
+        b.selection = None;
+        b.tokens = None;
+        b.pending_line = Some(line.unwrap_or(1));
+        if matches!(b.tree, Load::Ready(_)) {
+            b.reveal(&path);
+        }
+        if b.files.contains_key(&path) {
+            b.apply_pending_line();
+            return cx.notify();
+        }
+        b.files.insert(path.clone(), Load::Loading);
+        // Files of the PR: the analysis already fetched their head version.
+        let fi = pv.files().iter().position(|f| f.path == path);
+        let known = fi.and_then(|fi| pv.analysis.get(&fi)?.new.source.clone());
+        let diff = fi.map(|fi| pv.files()[fi].clone());
+        let (key, repo, sha) = (b.key.clone(), b.key.repo.clone(), b.sha.clone());
+        let task = cx.background_executor().spawn({
+            let path = path.clone();
+            async move {
+                let source = match known {
+                    Some(source) => source.to_string(),
+                    None => github::file_content(&repo, &sha, &path)?,
+                };
+                anyhow::Ok(SourceFile::new(&source, &path, diff.as_ref()))
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(b) = this.browser.as_mut().filter(|b| b.key == key) else { return };
+                b.files.insert(path, result.map_or_else(|e| Load::Failed(format!("{e:#}")), |f| Load::Ready(Arc::new(f))));
+                b.apply_pending_line();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    pub fn browser_toggle_dir(&mut self, path: &str, cx: &mut Context<Self>) {
+        if let Some(b) = &mut self.browser {
+            b.toggle_dir(path);
+            cx.notify();
+        }
+    }
+
+    /// Context for Claude about the selected lines of the file view.
+    fn source_context(&self) -> Option<ChangeContext> {
+        let pv = self.pr.as_ref()?;
+        let b = self.browser.as_ref()?;
+        let file = b.current()?;
+        let range = b.selected_range()?;
+        let lines = file.lines.get(range.start..range.end.min(file.lines.len()))?;
+        let location = if range.len() == 1 {
+            format!("L{} (head)", range.start + 1)
+        } else {
+            format!("L{}–L{} (head)", range.start + 1, range.end)
+        };
+        Some(ChangeContext {
+            repo: pv.key.repo.clone(),
+            pr_number: pv.key.number,
+            pr_title: pv.summary.title.clone(),
+            file: b.path.clone()?,
+            location,
+            snippet: lines.iter().map(|l| format!(" {l}")).collect::<Vec<_>>().join("\n"),
+        })
     }
 
     /// Jumps to a symbol by name in a file (plan steps, palette).
@@ -1130,10 +1589,9 @@ impl Prmator {
         let key = (pv.key.repo.clone(), name.clone());
         if !self.defs.contains_key(&key) {
             self.defs.insert(key.clone(), DefState::Loading);
-            let lang = pv
-                .files()
-                .get(pv.current_file)
-                .and_then(|f| prmator_syntax::detect(&f.path))
+            let in_browser = self.browser.as_ref().and_then(|b| prmator_syntax::detect(b.path.as_ref()?));
+            let lang = in_browser
+                .or_else(|| pv.files().get(pv.current_file).and_then(|f| prmator_syntax::detect(&f.path)))
                 .or_else(|| pv.analysis.values().next().map(|a| a.lang));
             let Some(lang) = lang else {
                 self.defs.insert(key, DefState::NotFound);
@@ -1212,8 +1670,19 @@ impl Prmator {
         pv.file_index(&def.path).filter(|_| def.source == defs::DefSource::ThisPr)
     }
 
-    pub fn jump_to_definition(&mut self, def: Arc<Definition>, cx: &mut Context<Self>) {
+    pub fn jump_to_definition(&mut self, def: Arc<Definition>, window: &mut Window, cx: &mut Context<Self>) {
         self.hover = None;
+        if self.browser.is_some() || self.definition_in_diff(&def).is_none() {
+            // In the file view, or outside the diff: show it in the file view.
+            if self.definition_in_repo(&def) {
+                if self.browser.is_some() {
+                    self.browser_open_file(def.path.clone(), Some(def.start_line), cx);
+                } else {
+                    self.open_browser(Some((def.path.clone(), def.start_line)), window, cx);
+                }
+            }
+            return cx.notify();
+        }
         if let Some(fi) = self.definition_in_diff(&def) {
             if let Some(pv) = &mut self.pr {
                 if !pv.jump_to_lines(fi, true, def.start_line..def.end_line + 1) {
@@ -1222,6 +1691,13 @@ impl Prmator {
             }
         }
         cx.notify();
+    }
+
+    /// Whether a definition is in this PR's repo (so the file view can show it).
+    pub fn definition_in_repo(&self, def: &Definition) -> bool {
+        let Some(pv) = &self.pr else { return false };
+        def.source == defs::DefSource::ThisPr
+            || def.url.as_deref().is_some_and(|u| u.contains(&format!("github.com/{}/", pv.key.repo)))
     }
 
     pub fn ask_about_definition(&mut self, def: Arc<Definition>, window: &mut Window, cx: &mut Context<Self>) {
@@ -1338,6 +1814,7 @@ impl Prmator {
                 }
             }
             Command::ReviewAsStory => self.continue_story(cx),
+            Command::OpenFileView => self.open_browser(None, window, cx),
             Command::AskAboutPr => {
                 let at = self.default_chat_position(window);
                 self.open_chat(None, at, None, window, cx)

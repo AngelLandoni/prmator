@@ -468,7 +468,7 @@ impl Prmator {
             return;
         }
         let Some(pv) = &self.pr else { return };
-        let Some(sha) = pv.detail.as_ref().map(|d| d.head_ref_oid.clone()) else { return };
+        let Some(sha) = pv.diff_sha() else { return };
         let (key, repo, number) = (pv.key.clone(), pv.key.repo.clone(), pv.key.number);
         let comment = self.popover_comment(body.clone()).map(|d| d.to_github());
         if let Some(p) = &mut self.comment_popover {
@@ -526,7 +526,7 @@ impl Prmator {
         let event = panel.event;
         let body = body.trim().to_string();
         let Some(pv) = &self.pr else { return };
-        let Some(sha) = pv.detail.as_ref().map(|d| d.head_ref_oid.clone()) else { return };
+        let Some(sha) = pv.diff_sha() else { return };
         let comments: Vec<NewComment> = pv.drafts.iter().map(|d| d.to_github()).collect();
         if comments.is_empty() && body.is_empty() && event == ReviewEvent::Comment {
             if let Some(p) = &mut self.review_panel {

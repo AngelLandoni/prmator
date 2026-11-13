@@ -2,7 +2,7 @@
 //! collapsible entry that can be expanded, continued, jumped to, copied or deleted.
 
 use gpui::{
-    div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, FontWeight, MouseButton, SharedString,
+    div, prelude::*, px, AnyElement, ClipboardItem, Context, Div, FontWeight, MouseButton, SharedString, StyledText,
 };
 
 use crate::app::Prmator;
@@ -10,7 +10,8 @@ use crate::chat::{ago, Conversation, Turn, TurnStatus};
 use crate::theme::{theme, Theme};
 
 use super::components::*;
-use super::markdown::render_markdown;
+use super::markdown::{render_in, MdSize};
+use super::select::selectable;
 
 impl Prmator {
     pub fn render_claude(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -167,7 +168,7 @@ impl Prmator {
                 .gap_3()
                 .px_3()
                 .pb_2()
-                .children(c.turns.iter().enumerate().map(|(i, turn)| render_turn(t, id, i, turn, cx)))
+                .children(c.turns.iter().enumerate().map(|(i, turn)| render_turn(t, "log", id, i, turn, cx)))
                 .child(
                     div()
                         .flex()
@@ -229,7 +230,10 @@ fn plural(n: usize, word: &str) -> String {
 }
 
 /// One question and its answer (used in the floating chat and the review log).
-pub fn render_turn(t: &Theme, conversation: u64, index: usize, turn: &Turn, cx: &mut Context<Prmator>) -> impl IntoElement {
+/// `place` tells the chat and the log apart, so a mouse selection stays in one of them.
+pub fn render_turn(t: &Theme, place: &str, conversation: u64, index: usize, turn: &Turn, cx: &mut Context<Prmator>) -> impl IntoElement {
+    let scope = format!("{place}-{conversation}");
+    let sel = t.accent.opacity(0.3);
     let request = turn.request;
     let follow_up = index > 0;
     let key = |what: &str| SharedString::from(format!("{what}-{conversation}-{index}"));
@@ -253,13 +257,15 @@ pub fn render_turn(t: &Theme, conversation: u64, index: usize, turn: &Turn, cx: 
                         .bg(t.accent_soft)
                         .text_sm()
                         .text_color(t.text)
-                        .child(SharedString::from(turn.question.clone())),
+                        .child(selectable(scope.clone(), StyledText::new(SharedString::from(turn.question.clone())), sel)),
                 ),
         )
         .children(turn.activity.iter().map(|a| {
             div().text_xs().font_family(t.mono.clone()).text_color(t.tool).child(SharedString::from(format!("▸ {a}")))
         }))
-        .when(!answer.is_empty(), |d| d.child(render_markdown(t, &answer)))
+        .when(!answer.is_empty(), |d| {
+            d.child(render_in(t, &answer, MdSize::Small, &format!("{scope}-{index}"), &scope))
+        })
         .child(
             div().flex().items_center().gap_2().text_xs().text_color(t.dim).map(|d| match &turn.status {
                 TurnStatus::Running => d.child(spinner_text(t, "thinking…")).child(

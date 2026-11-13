@@ -43,7 +43,8 @@ pub fn start() -> (Link, async_channel::Receiver<LinkEvent>) {
 
 async fn run(mut out_rx: UnboundedReceiver<Msg>, events: async_channel::Sender<LinkEvent>) {
     let explicit = std::env::var("PRMATOR_BRIDGE_URL").ok();
-    let url = explicit.clone().unwrap_or_else(|| format!("ws://127.0.0.1:{DEFAULT_PORT}"));
+    let base = explicit.clone().unwrap_or_else(|| format!("ws://127.0.0.1:{DEFAULT_PORT}"));
+    let url = format!("{}/?token={}", base.trim_end_matches('/'), bridge_token());
     // Kept alive for the app's lifetime: the bridge exits when this pipe closes.
     let mut bridge: Option<Child> = None;
 
@@ -82,6 +83,23 @@ async fn run(mut out_rx: UnboundedReceiver<Msg>, events: async_channel::Sender<L
     }
 }
 
+/// The secret the bridge asks of every connection, so other local programs (or web pages
+/// opening a WebSocket to localhost) can't run Claude through it. Random per app launch;
+/// set `PRMATOR_BRIDGE_TOKEN` to share one with a bridge started by hand.
+fn bridge_token() -> &'static str {
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        std::env::var("PRMATOR_BRIDGE_TOKEN").ok().filter(|t| !t.is_empty()).unwrap_or_else(|| {
+            use std::io::Read;
+            let mut bytes = [0u8; 24];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut bytes))
+                .expect("read /dev/urandom");
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
+        })
+    })
+}
+
 /// Starts `prmator-claude` from next to our own executable, tied to our lifetime.
 fn spawn_bridge() -> Option<Child> {
     let exe = std::env::current_exe().ok()?.parent()?.join("prmator-claude");
@@ -91,6 +109,7 @@ fn spawn_bridge() -> Option<Child> {
     }
     match std::process::Command::new(&exe)
         .arg("--exit-with-parent")
+        .env("PRMATOR_BRIDGE_TOKEN", bridge_token())
         .stdin(Stdio::piped())
         .spawn()
     {

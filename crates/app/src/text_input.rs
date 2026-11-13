@@ -8,7 +8,7 @@ use gpui::{
     ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
+    ScrollHandle, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window,
 };
 use unicode_segmentation::*;
 
@@ -72,7 +72,15 @@ pub struct TextInput {
     /// Multi-line layout from the last paint: one wrapped line per paragraph.
     last_lines: Vec<WrappedLine>,
     last_line_height: Pixels,
+    /// Multi-line only: the text scrolls past [`MAX_LINES`].
+    scroll: ScrollHandle,
+    /// (cursor, length) the scroll position was last fitted to: it only follows the cursor
+    /// when one of them changes, so wheel scrolling isn't undone.
+    scrolled_for: (usize, usize),
 }
+
+/// A multi-line input grows up to this many lines, then scrolls.
+const MAX_LINES: f32 = 12.;
 
 /// Emitted on Enter with the (non-empty) content; the input clears itself.
 pub struct Submitted(pub String);
@@ -159,6 +167,8 @@ impl TextInput {
             enter_newline: false,
             last_lines: vec![],
             last_line_height: px(20.),
+            scroll: ScrollHandle::new(),
+            scrolled_for: (0, 0),
         }
     }
 
@@ -182,6 +192,13 @@ impl TextInput {
 
     pub fn text(&self) -> &str {
         &self.content
+    }
+
+    /// Selects everything (e.g. when a find bar is focused again).
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        self.selected_range = 0..self.content.len();
+        self.selection_reversed = false;
+        cx.notify();
     }
 
     /// Replaces the content and puts the cursor at the end.
@@ -430,6 +447,10 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
+        // Nothing selected here: copy text selected elsewhere (e.g. Claude's answer above).
+        if self.selected_range.is_empty() && crate::ui::select::copy(cx) {
+            return;
+        }
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
@@ -1100,11 +1121,35 @@ impl Element for TextAreaElement {
             }
         }
         let lines = std::mem::take(&mut prepaint.lines);
-        self.input.update(cx, |input, _| {
+        let refit = self.input.update(cx, |input, _| {
             input.last_lines = if input.content.is_empty() { vec![] } else { lines };
             input.last_bounds = Some(bounds);
             input.last_line_height = lh;
+            let now = (input.cursor_offset(), input.content.len());
+            if input.scrolled_for == now {
+                return false;
+            }
+            input.scrolled_for = now;
+            // Keep the cursor in view of the scrolling box.
+            let Some(cursor) = input.area_position(now.0) else { return false };
+            let (top, bottom) = (bounds.top() + cursor.y, bounds.top() + cursor.y + lh);
+            let view = input.scroll.bounds();
+            let pad = px(8.);
+            let mut offset = input.scroll.offset();
+            if top < view.top() + pad {
+                offset.y += view.top() + pad - top;
+            } else if bottom > view.bottom() - pad {
+                offset.y -= bottom - (view.bottom() - pad);
+            } else {
+                return false;
+            }
+            offset.y = offset.y.min(px(0.));
+            input.scroll.set_offset(offset);
+            true
         });
+        if refit {
+            window.refresh();
+        }
     }
 }
 
@@ -1165,11 +1210,19 @@ impl Render for TextInput {
                 if multiline {
                     d.child(
                         div()
-                            .min_h(rems(1.25 * 3. + 1.))
+                            .id("text-area")
                             .w_full()
-                            .px(px(10.))
-                            .py(rems(0.5))
-                            .child(TextAreaElement { input: cx.entity() }),
+                            .max_h(rems(1.25 * MAX_LINES + 1.))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll)
+                            .child(
+                                div()
+                                    .min_h(rems(1.25 * 3. + 1.))
+                                    .w_full()
+                                    .px(px(10.))
+                                    .py(rems(0.5))
+                                    .child(TextAreaElement { input: cx.entity() }),
+                            ),
                     )
                 } else {
                     d.child(

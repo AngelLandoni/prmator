@@ -1,5 +1,6 @@
 //! Rendering of the root view: toolbar on top, then [sidebar | diff | Claude].
 
+pub mod browser;
 pub mod chat;
 pub mod claude_panel;
 pub mod comments;
@@ -9,6 +10,7 @@ pub mod hover;
 pub mod markdown;
 pub mod overview;
 pub mod palette;
+pub mod select;
 pub mod settings_window;
 pub mod sidebar;
 pub mod story;
@@ -164,9 +166,15 @@ impl Render for Prmator {
         let t = theme(cx).clone();
         // Like Zed's ui_font_size: rem-based sizes across the UI scale with it.
         window.set_rem_size(px(t.ui_size));
-        let left = match &self.pr {
-            Some(_) => self.render_pr_sidebar(cx).into_any_element(),
-            None => self.render_pr_list(cx).into_any_element(),
+        self.refresh_find();
+        let left = match (&self.pr, &self.browser) {
+            (Some(_), Some(_)) => self.render_browser_tree(cx).into_any_element(),
+            (Some(_), None) => self.render_pr_sidebar(cx).into_any_element(),
+            (None, _) => self.render_pr_list(cx).into_any_element(),
+        };
+        let center = match (&self.pr, &self.browser) {
+            (Some(_), Some(_)) => self.render_browser_source(cx).into_any_element(),
+            _ => self.render_center(cx),
         };
         div()
             .size_full()
@@ -187,8 +195,16 @@ impl Render for Prmator {
             .on_action(cx.listener(|this, _: &OpenFiles, window, cx| this.open_palette(PaletteMode::Files, window, cx)))
             .on_action(cx.listener(|this, _: &OpenSymbols, window, cx| this.open_palette(PaletteMode::Symbols, window, cx)))
             .on_action(cx.listener(|this, _: &OpenCommands, window, cx| this.open_palette(PaletteMode::Commands, window, cx)))
-            .on_action(cx.listener(|this, _: &SearchDiff, window, cx| this.open_palette(PaletteMode::Text, window, cx)))
+            .on_action(cx.listener(|this, _: &SearchDiff, window, cx| this.open_find(window, cx)))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| this.find_step(1, cx)))
+            .on_action(cx.listener(|this, _: &FindPrev, _, cx| this.find_step(-1, cx)))
             .on_action(cx.listener(|this, _: &PlanReview, _, cx| this.plan_review(cx)))
+            // ⌘C with nothing more specific focused: copy selected text.
+            .on_action(cx.listener(|_, _: &CopySelection, _, cx| {
+                select::copy(cx);
+            }))
+            // Must paint first: it resets the selectable-text registry each frame.
+            .child(select::root())
             .child(self.render_toolbar(cx))
             .child(
                 div()
@@ -205,7 +221,7 @@ impl Render for Prmator {
                             .border_color(t.border)
                             .child(left),
                     )
-                    .child(div().flex_1().min_w_0().h_full().child(self.render_center(cx)))
+                    .child(div().flex_1().min_w_0().h_full().child(center))
                     .child(
                         div()
                             .w(px(420.))
@@ -226,6 +242,7 @@ impl Render for Prmator {
                 let at = gpui::point(window.viewport_size().width - px(420. + 540.), px(88.));
                 d.children(self.render_review_panel(at, cx))
             })
+            .when(self.find.is_some(), |d| d.children(self.render_find_bar(cx)))
             .when(self.palette.is_some(), |d| d.child(self.render_palette(cx)))
     }
 }

@@ -1,149 +1,130 @@
-// Draws PRmator's app icon (1024×1024 PNG): a diff card with removed/added lines on an
-// indigo→violet squircle, with a Claude-style sparkle.
+// Draws PRmator's app icon (1024×1024 PNG). Flat and precise, like bubblegum's: a matte
+// black tile, one crisp white line mark, a single red accent. Several directions can be
+// rendered; `scripts/make-app.sh` uses the default one.
 //
-//   swift assets/icon/make_icon.swift assets/icon/icon.png
+//   swift assets/icon/make_icon.swift OUTPUT.png [pr|diff|review]   (pr is the icon)
 
 import AppKit
-import CoreGraphics
 
 let size: CGFloat = 1024
-let out = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "icon.png"
+let args = CommandLine.arguments.dropFirst()
+let output = args.first ?? "icon.png"
+let variant = args.dropFirst().first ?? "pr"
 
-func rgb(_ hex: UInt32, _ a: CGFloat = 1) -> CGColor {
+func color(_ hex: UInt32, _ alpha: CGFloat = 1) -> CGColor {
     CGColor(
-        red: CGFloat((hex >> 16) & 0xff) / 255,
+        srgbRed: CGFloat((hex >> 16) & 0xff) / 255,
         green: CGFloat((hex >> 8) & 0xff) / 255,
         blue: CGFloat(hex & 0xff) / 255,
-        alpha: a
-    )
+        alpha: alpha)
 }
 
-let space = CGColorSpace(name: CGColorSpace.sRGB)!
+let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
 let ctx = CGContext(
     data: nil, width: Int(size), height: Int(size), bitsPerComponent: 8, bytesPerRow: 0,
-    space: space, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-)!
-// Flip so y grows downward, like a design tool.
-ctx.translateBy(x: 0, y: size)
-ctx.scaleBy(x: 1, y: -1)
+    space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
 
-func gradient(_ colors: [CGColor], _ locations: [CGFloat]) -> CGGradient {
-    CGGradient(colorsSpace: space, colors: colors as CFArray, locations: locations)!
-}
+let white: UInt32 = 0xf2f2f2
+let red: UInt32 = 0xe31937
+let weight: CGFloat = 30
 
-// --- Squircle background (macOS icon grid: 824pt body, 100pt margin).
-let body = CGRect(x: 100, y: 100, width: 824, height: 824)
-let squircle = CGPath(roundedRect: body, cornerWidth: 186, cornerHeight: 186, transform: nil)
+// macOS icon grid: an 824pt rounded square centered on a 1024pt canvas (y grows up).
+let tile = CGRect(x: 100, y: 100, width: 824, height: 824)
+let tilePath = CGPath(roundedRect: tile, cornerWidth: 185, cornerHeight: 185, transform: nil)
 
-// Drop shadow.
-ctx.saveGState()
-ctx.setShadow(offset: CGSize(width: 0, height: 18), blur: 40, color: rgb(0x000000, 0.35))
-ctx.addPath(squircle)
-ctx.setFillColor(rgb(0x1e1b4b))
-ctx.fillPath()
-ctx.restoreGState()
-
-ctx.saveGState()
-ctx.addPath(squircle)
-ctx.clip()
-ctx.drawLinearGradient(
-    gradient([rgb(0x312e81), rgb(0x4f46e5), rgb(0x7c3aed)], [0, 0.55, 1]),
-    start: CGPoint(x: 100, y: 100), end: CGPoint(x: 924, y: 924), options: []
-)
-// Soft glow behind the sparkle.
-ctx.drawRadialGradient(
-    gradient([rgb(0xfbbf24, 0.45), rgb(0xfbbf24, 0)], [0, 1]),
-    startCenter: CGPoint(x: 770, y: 250), startRadius: 0,
-    endCenter: CGPoint(x: 770, y: 250), endRadius: 330, options: []
-)
-// Top sheen.
-ctx.drawLinearGradient(
-    gradient([rgb(0xffffff, 0.10), rgb(0xffffff, 0)], [0, 1]),
-    start: CGPoint(x: 0, y: 100), end: CGPoint(x: 0, y: 470), options: []
-)
-ctx.restoreGState()
-
-// --- Diff card.
-let card = CGRect(x: 196, y: 300, width: 560, height: 480)
-ctx.saveGState()
-ctx.setShadow(offset: CGSize(width: 0, height: 22), blur: 44, color: rgb(0x0f0a2e, 0.55))
-ctx.addPath(CGPath(roundedRect: card, cornerWidth: 54, cornerHeight: 54, transform: nil))
-ctx.setFillColor(rgb(0xffffff, 0.97))
-ctx.fillPath()
-ctx.restoreGState()
-
-// Card title bar dots.
-for (i, c) in [0xff5f57, 0xfebc2e, 0x28c840].enumerated() {
-    ctx.setFillColor(rgb(UInt32(c)))
-    ctx.fillEllipse(in: CGRect(x: 240 + CGFloat(i) * 40, y: 340, width: 24, height: 24))
-}
-
-// Diff rows: (kind, code bar width). Kind: 0 context, -1 removed, 1 added.
-let rows: [(Int, CGFloat)] = [(0, 300), (-1, 360), (1, 400), (1, 250), (0, 330)]
-let rowHeight: CGFloat = 64
-for (i, (kind, width)) in rows.enumerated() {
-    let y = 398 + CGFloat(i) * (rowHeight + 10)
-    let rowRect = CGRect(x: 224, y: y, width: 504, height: rowHeight)
-    if kind != 0 {
-        ctx.addPath(CGPath(roundedRect: rowRect, cornerWidth: 16, cornerHeight: 16, transform: nil))
-        ctx.setFillColor(kind > 0 ? rgb(0xdafbe1) : rgb(0xffebe9))
-        ctx.fillPath()
-    }
-    // +/− sign (unchanged lines have none).
-    let cx: CGFloat = 262, cy = y + rowHeight / 2
-    if kind != 0 {
-        ctx.setFillColor(kind > 0 ? rgb(0x1a7f37) : rgb(0xcf222e))
-        ctx.fill(CGRect(x: cx - 15, y: cy - 5, width: 30, height: 10))
-    }
-    if kind > 0 {
-        ctx.fill(CGRect(x: cx - 5, y: cy - 15, width: 10, height: 30))
-    }
-    // Code bar(s).
-    let barColor = kind > 0 ? rgb(0x2da44e, 0.75) : kind < 0 ? rgb(0xe5534b, 0.7) : rgb(0xb8bfcc)
-    ctx.setFillColor(barColor)
-    let bar = CGRect(x: 304, y: cy - 11, width: width * 0.45, height: 22)
-    ctx.addPath(CGPath(roundedRect: bar, cornerWidth: 11, cornerHeight: 11, transform: nil))
+func drawTile() {
+    ctx.saveGState()
+    ctx.setShadow(offset: CGSize(width: 0, height: -10), blur: 24, color: color(0x000000, 0.35))
+    ctx.addPath(tilePath)
+    ctx.setFillColor(color(0x0a0a0b))
     ctx.fillPath()
-    let bar2 = CGRect(x: 304 + width * 0.45 + 18, y: cy - 11, width: width * 0.4, height: 22)
-    ctx.setFillColor(kind == 0 ? rgb(0xd5d9e2) : barColor.copy(alpha: 0.45)!)
-    ctx.addPath(CGPath(roundedRect: bar2, cornerWidth: 11, cornerHeight: 11, transform: nil))
+    ctx.restoreGState()
+    ctx.saveGState()
+    ctx.addPath(tilePath)
+    ctx.clip()
+    let g = CGGradient(
+        colorsSpace: colorSpace, colors: [color(0x1c1c1f), color(0x0a0a0b)] as CFArray,
+        locations: [0, 1])!
+    ctx.drawLinearGradient(
+        g, start: CGPoint(x: 512, y: 924), end: CGPoint(x: 512, y: 100), options: [])
+    ctx.restoreGState()
+}
+
+func circle(_ c: CGPoint, _ r: CGFloat) -> CGRect {
+    CGRect(x: c.x - r, y: c.y - r, width: r * 2, height: r * 2)
+}
+
+func fill(_ path: CGPath, _ hex: UInt32) {
+    ctx.addPath(path)
+    ctx.setFillColor(color(hex))
     ctx.fillPath()
 }
 
-// --- Sparkle (four-pointed star) overlapping the card's top-right corner.
-func sparkle(center c: CGPoint, radius r: CGFloat, waist w: CGFloat) -> CGPath {
+func stroke(_ path: CGPath, _ hex: UInt32, cap: CGLineCap = .round) {
+    fill(path.copy(strokingWithWidth: weight, lineCap: cap, lineJoin: .round, miterLimit: 10), hex)
+}
+
+func ring(_ c: CGPoint, _ r: CGFloat, _ hex: UInt32) {
+    stroke(CGPath(ellipseIn: circle(c, r), transform: nil), hex, cap: .butt)
+}
+
+func line(_ points: [CGPoint]) -> CGPath {
     let p = CGMutablePath()
-    p.move(to: CGPoint(x: c.x, y: c.y - r))
-    p.addQuadCurve(to: CGPoint(x: c.x + r, y: c.y), control: CGPoint(x: c.x + w, y: c.y - w))
-    p.addQuadCurve(to: CGPoint(x: c.x, y: c.y + r), control: CGPoint(x: c.x + w, y: c.y + w))
-    p.addQuadCurve(to: CGPoint(x: c.x - r, y: c.y), control: CGPoint(x: c.x - w, y: c.y + w))
-    p.addQuadCurve(to: CGPoint(x: c.x, y: c.y - r), control: CGPoint(x: c.x - w, y: c.y - w))
-    p.closeSubpath()
+    p.addLines(between: points)
     return p
 }
 
-let star = sparkle(center: CGPoint(x: 752, y: 292), radius: 128, waist: 22)
-ctx.saveGState()
-ctx.setShadow(offset: CGSize(width: 0, height: 10), blur: 30, color: rgb(0xb45309, 0.6))
-ctx.addPath(star)
-ctx.setFillColor(rgb(0xf59e0b))
-ctx.fillPath()
-ctx.restoreGState()
-ctx.saveGState()
-ctx.addPath(star)
-ctx.clip()
-ctx.drawLinearGradient(
-    gradient([rgb(0xfde68a), rgb(0xf59e0b), rgb(0xea580c)], [0, 0.5, 1]),
-    start: CGPoint(x: 680, y: 170), end: CGPoint(x: 830, y: 420), options: []
-)
-ctx.restoreGState()
-// Small companion sparkle.
-ctx.addPath(sparkle(center: CGPoint(x: 862, y: 430), radius: 44, waist: 8))
-ctx.setFillColor(rgb(0xfde68a, 0.95))
-ctx.fillPath()
+drawTile()
 
-// --- Write PNG.
+switch variant {
+case "diff":
+    // A diff, reduced: lines of code, one of them changed (red marker in the gutter).
+    let rows: [(CGFloat, CGFloat)] = [(660, 300), (580, 220), (500, 340), (420, 260), (340, 180)]
+    for (i, (y, w)) in rows.enumerated() {
+        stroke(line([CGPoint(x: 400, y: y), CGPoint(x: 400 + w, y: y)]), i == 2 ? red : white)
+    }
+    stroke(line([CGPoint(x: 300, y: 500), CGPoint(x: 340, y: 500)]), red)
+case "review":
+    // A comment bubble with a +/− diff inside: review on a change.
+    // One outline: rounded box, the tail cut into its bottom-left edge.
+    let bubble = CGMutablePath()
+    let (x0, x1, y0, y1, cr): (CGFloat, CGFloat, CGFloat, CGFloat, CGFloat) = (262, 762, 362, 742, 90)
+    bubble.move(to: CGPoint(x: 452, y: y0))
+    bubble.addArc(tangent1End: CGPoint(x: x1, y: y0), tangent2End: CGPoint(x: x1, y: y1), radius: cr)
+    bubble.addArc(tangent1End: CGPoint(x: x1, y: y1), tangent2End: CGPoint(x: x0, y: y1), radius: cr)
+    bubble.addArc(tangent1End: CGPoint(x: x0, y: y1), tangent2End: CGPoint(x: x0, y: y0), radius: cr)
+    bubble.addArc(tangent1End: CGPoint(x: x0, y: y0), tangent2End: CGPoint(x: x1, y: y0), radius: cr)
+    bubble.addLine(to: CGPoint(x: 362, y: y0))
+    bubble.addLine(to: CGPoint(x: 322, y: 272))
+    bubble.closeSubpath()
+    stroke(bubble, white)
+    stroke(line([CGPoint(x: 362, y: 600), CGPoint(x: 442, y: 600)]), red)
+    stroke(line([CGPoint(x: 362, y: 500), CGPoint(x: 442, y: 500)]), white)
+    stroke(line([CGPoint(x: 402, y: 460), CGPoint(x: 402, y: 540)]), white)
+    stroke(line([CGPoint(x: 500, y: 600), CGPoint(x: 662, y: 600)]), white)
+    stroke(line([CGPoint(x: 500, y: 500), CGPoint(x: 622, y: 500)]), white)
+default:
+    // "pr": the pull request mark, reduced. The base branch on the left; on the right the
+    // change, coming back over to it, with its commit in red.
+    let r: CGFloat = 58
+    let left = CGPoint(x: 372, y: 0), right = CGPoint(x: 652, y: 0)
+    let top: CGFloat = 690, bottom: CGFloat = 334
+    ring(CGPoint(x: left.x, y: top), r, white)
+    ring(CGPoint(x: left.x, y: bottom), r, white)
+    stroke(line([CGPoint(x: left.x, y: top - r - weight / 2), CGPoint(x: left.x, y: bottom + r + weight / 2)]), white, cap: .butt)
+
+    ring(CGPoint(x: right.x, y: bottom), r, red)
+    let path = CGMutablePath()
+    path.move(to: CGPoint(x: right.x, y: bottom + r + weight / 2))
+    path.addLine(to: CGPoint(x: right.x, y: top - 70))
+    path.addArc(tangent1End: CGPoint(x: right.x, y: top), tangent2End: CGPoint(x: right.x - 70, y: top), radius: 70)
+    path.addLine(to: CGPoint(x: 492, y: top))
+    stroke(path, white, cap: .butt)
+    // Arrowhead pointing back at the base branch.
+    stroke(line([CGPoint(x: 552, y: top + 62), CGPoint(x: 490, y: top), CGPoint(x: 552, y: top - 62)]), white)
+}
+
 let image = ctx.makeImage()!
 let rep = NSBitmapImageRep(cgImage: image)
-try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: out))
-print("wrote \(out)")
+try! rep.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: output))
+print("wrote \(output)")

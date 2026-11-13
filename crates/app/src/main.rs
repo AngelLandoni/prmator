@@ -11,10 +11,13 @@ mod chat;
 mod comments;
 mod defs;
 mod diff;
+mod find;
 mod github;
 mod link;
 mod mac;
 mod model;
+mod selection;
+mod browser;
 mod settings;
 mod stacks;
 mod store;
@@ -45,6 +48,9 @@ actions!(
         OpenSymbols,
         OpenCommands,
         SearchDiff,
+        FindNext,
+        FindPrev,
+        CloseFind,
         PlanReview,
         NextStep,
         PrevStep,
@@ -74,6 +80,15 @@ actions!(
         CommentBoxReset,
         CommentScrollUp,
         CommentScrollDown,
+        TokenLeft,
+        TokenRight,
+        TokenUp,
+        TokenDown,
+        ExtendLeft,
+        ExtendRight,
+        ExtendUp,
+        ExtendDown,
+        ToggleFileView,
     ]
 );
 
@@ -316,9 +331,12 @@ fn main() {
         text_input::bind_keys(cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         let diff = Some("DiffPane");
+        let source = Some("SourceView");
+        let code = Some("DiffPane || SourceView");
         let palette = Some("Palette");
         cx.bind_keys([
             KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-c", CopySelection, None),
             KeyBinding::new("cmd-r", Refresh, None),
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-e", ToggleReviewMode, None),
@@ -328,6 +346,13 @@ fn main() {
             KeyBinding::new("cmd-shift-p", OpenCommands, None),
             KeyBinding::new("cmd-k", OpenCommands, None),
             KeyBinding::new("cmd-f", SearchDiff, None),
+            // Find bar: ↵ / ⇧↵ step through matches (beats the input's own Enter: same
+            // depth, bound later), ⌘G / ⇧⌘G too, esc closes.
+            KeyBinding::new("enter", FindNext, Some("FindBar > TextInput")),
+            KeyBinding::new("shift-enter", FindPrev, Some("FindBar > TextInput")),
+            KeyBinding::new("escape", CloseFind, Some("FindBar")),
+            KeyBinding::new("cmd-g", FindNext, None),
+            KeyBinding::new("cmd-shift-g", FindPrev, None),
             KeyBinding::new("j", NextFile, diff),
             KeyBinding::new("n", NextFile, diff),
             KeyBinding::new("k", PrevFile, diff),
@@ -342,6 +367,20 @@ fn main() {
             KeyBinding::new(".", NextCommit, diff),
             KeyBinding::new(",", PrevCommit, diff),
             KeyBinding::new("m", AddComment, diff),
+            KeyBinding::new("f", ToggleFileView, diff),
+            // Token-wise selection, in the diff and the file view.
+            KeyBinding::new("left", TokenLeft, code),
+            KeyBinding::new("right", TokenRight, code),
+            KeyBinding::new("up", TokenUp, code),
+            KeyBinding::new("down", TokenDown, code),
+            KeyBinding::new("shift-left", ExtendLeft, code),
+            KeyBinding::new("shift-right", ExtendRight, code),
+            KeyBinding::new("shift-up", ExtendUp, code),
+            KeyBinding::new("shift-down", ExtendDown, code),
+            KeyBinding::new("f", ToggleFileView, source),
+            KeyBinding::new("a", AskSelection, source),
+            KeyBinding::new("cmd-c", CopySelection, source),
+            KeyBinding::new("escape", Dismiss, source),
             KeyBinding::new("escape", CloseCommentPopover, Some("CommentPopover")),
             KeyBinding::new("cmd-shift-enter", CommentPostNow, Some("CommentPopover")),
             KeyBinding::new("cmd-alt-left", CommentBoxLeft, Some("CommentPopover")),

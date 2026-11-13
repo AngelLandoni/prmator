@@ -48,8 +48,10 @@ existing bridge if one is already listening.
   - **Plan:** Claude's review route, shown as a pipeline. It starts at the entry point, follows the flow and ends with tests, and each step says what to check. Progress is saved, so `c` continues where you left off.
 - **Diff:** **Unified** or **Split** (side by side) from the toolbar or `s`, with tree-sitter syntax colours computed from the full file at the merge base and the head, plus word-level change highlights.
 - **Expand context:** the bars between hunks reveal hidden unchanged lines: `↑` above the next hunk, `↓` below the previous one (20 at a time), or *Expand all*. **⇕ Full file** on a file header shows the whole file. Revealed lines get syntax colours, hover cards and right-click like the rest.
+- **📄 File view:** *View file* on a file header (or `f`, or *Open in file view* in the right-click menu) shows the whole file at the PR's head, without diff, next to the **project tree** (every file of the repo, not only the changed ones). Folders holding changed files have a dot and changed files their status letter; in a changed file, added and modified lines have a green/orange bar in the gutter and removed lines a red mark. Hover cards, the right-click menu and *Ask Claude* work there too, and *Open file* on a hover card opens definitions from anywhere in the repo. `f`, `esc` or *← Back to review* return to the diff.
+- **Token selection:** in the diff and the file view, a click selects the whole token under the mouse (there is no caret inside a word), dragging extends token by token, and a double-click takes the line. `←` `→` move to the previous/next token (across lines), `↑` `↓` to the token in the same column above/below, and `⇧` extends; selections can span lines. Clicking the line numbers still selects whole lines. `⌘C` copies the selected text.
 - **Hover** a type name to see its definition in a card. It looks in the PR's own files, then `$PRMATOR_CODE_DIR`, then GitHub code search, and the card has *Ask Claude*, *Jump to it* and *GitHub ↗*.
-- **Right-click** a line or selection, hunk header, or file header to get *Ask Claude…*, *Explain*, *Find bugs & risks*, *Suggest a simpler version*, *What could this break?* or *Copy diff*.
+- **Right-click** a token, selection, hunk header or file header. The menu is split by purpose: **Navigate** (show the definition of the identifier, find it in the diff, open in file view), **Review** (add a comment), **Ask Claude** (a free question, *Explain*, *Find bugs & risks*, … and *What is `X`?*) and **Copy** (the selection, or the lines as a diff).
 - **Ask Claude** opens a **floating chat** next to the code. You can go back and forth there (↵ sends, ⇧↵ adds a line, long questions wrap); each chat is its own Claude session. **Done** (`esc` / `⌘↵`) files it into the **review log** on the right. The log is a list of collapsible entries (code location, first question, turns), each with *Continue*, *Jump to code*, *Copy* and *Delete*, and it is saved per PR so you can come back to it.
 - **Toolbar:** it doubles as the window titlebar (drag or double-click its empty areas), so content fills the window. It holds search, the Plan / Continue button, Unified/Split and the theme picker.
 - **Themes:** all of Zed's themes (One, Ayu, Gruvbox) plus any Zed themes installed on your Mac (`~/.config/zed/themes` and theme extensions), previewed live as you browse. Pick one from the toolbar or with *Theme: select…*. The picked theme becomes your light or dark theme, and *Theme mode* (follow system / light / dark) chooses between them, as in Zed. `prmator --themes` lists what was found.
@@ -66,11 +68,13 @@ existing bridge if one is already listening.
 | `v` | mark file viewed (collapses it, jumps to the next unviewed file) |
 | `s` | unified ⇄ side by side |
 | `a` | ask Claude about the selection (opens the floating chat) |
-| `⌘C` | copy the selected diff lines |
+| `⌘C` | copy the selected text (or the selected diff lines) |
 | `esc` | close the card or menu, or clear the selection |
 | `⌘E` | enter / exit review mode (Conversation ⇄ Files changed) |
 | `.` / `,` | story: mark commit reviewed and go to the next / previous commit |
 | `m` | comment on the selected lines |
+| `f` | open / close the file view (full file + project tree) |
+| `←` `→` / `↑` `↓` | select the previous / next token, or the one above / below (`⇧` extends) |
 | `⌥←` `⌥→` / `⌘←` `⌘→` / `⌘↑` `⌘↓` | in any text field: by word / to line start, end / to text start, end (add `⇧` to select; `⌥⌫` `⌘⌫` delete) |
 | `⌥⌘` arrows / `⇧⌥⌘` arrows | comment box: move / resize |
 | `⌘=` / `⌘−` / `⌘0` | comment box: bigger / smaller / back next to the line |

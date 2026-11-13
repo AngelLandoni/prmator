@@ -432,9 +432,28 @@ fn gh_post(path: &str, payload: &Value) -> anyhow::Result<Value> {
         if msg.is_empty() {
             msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
         }
+        log_failed_post(path, payload, &out.stdout, &out.stderr);
         bail!("GitHub refused: {msg}");
     }
     Ok(serde_json::from_slice(&out.stdout).unwrap_or_default())
+}
+
+/// Appends a refused request and GitHub's full answer to
+/// `~/Library/Logs/PRmator/github-errors.log` (the UI only shows the short message).
+fn log_failed_post(path: &str, payload: &Value, stdout: &[u8], stderr: &[u8]) {
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let dir = std::path::PathBuf::from(home).join("Library/Logs/PRmator");
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("github-errors.log")) else { return };
+    use std::io::Write;
+    let when = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let _ = writeln!(
+        f,
+        "=== {when} POST {path}\n{}\n--- response\n{}\n{}\n",
+        serde_json::to_string_pretty(payload).unwrap_or_default(),
+        String::from_utf8_lossy(stdout).trim(),
+        String::from_utf8_lossy(stderr).trim()
+    );
 }
 
 /// Self-test of the POST path against GitHub's side-effect-free markdown endpoint.
@@ -573,13 +592,36 @@ pub fn file_content(repo: &str, sha: &str, path: &str) -> anyhow::Result<String>
     ])
 }
 
+/// Every file path in the repo at `sha`, and whether GitHub truncated the list (very large
+/// repos).
+pub fn repo_tree(repo: &str, sha: &str) -> anyhow::Result<(Vec<String>, bool)> {
+    let out = gh(&["api", &format!("repos/{repo}/git/trees/{sha}?recursive=1")])?;
+    let v: Value = serde_json::from_str(&out)?;
+    let paths = v["tree"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| e["type"] == "blob")
+        .filter_map(|e| e["path"].as_str().map(String::from))
+        .collect();
+    Ok((paths, v["truncated"].as_bool().unwrap_or(false)))
+}
+
 /// The signed-in user's login.
 pub fn viewer_login() -> anyhow::Result<String> {
     Ok(gh(&["api", "user", "--jq", ".login"])?.trim().to_string())
 }
 
+/// Opens a web link. Links can come from PR text written by anyone, so only http(s) and
+/// mailto go through: `open` would also launch apps, local files (`file:`) and custom
+/// URL schemes, or read a leading `-` as a flag.
 pub fn open_in_browser(url: &str) {
-    let _ = Command::new("open").arg(url).spawn();
+    let lower = url.trim().to_ascii_lowercase();
+    if !["https://", "http://", "mailto:"].iter().any(|s| lower.starts_with(s)) {
+        eprintln!("not opening non-web link: {url}");
+        return;
+    }
+    let _ = Command::new("open").arg(url.trim()).spawn();
 }
 
 /// "2026-10-19T10:27:00Z" -> "3h ago" (relative to now, coarse).

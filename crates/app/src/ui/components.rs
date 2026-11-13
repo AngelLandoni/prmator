@@ -2,11 +2,15 @@
 
 use std::ops::Range;
 
-use gpui::{div, prelude::*, px, Div, ElementId, FontWeight, HighlightStyle, Hsla, SharedString, Stateful, StyledText};
+use gpui::{
+    canvas, div, fill, point, prelude::*, px, quad, size, BorderStyle, Bounds, Corners, Div, Edges, ElementId,
+    FontWeight, HighlightStyle, Hsla, Pixels, SharedString, Stateful, StyledText, TextLayout,
+};
 use prmator_syntax::Highlight;
 use protocol::ChangeContext;
 
 use crate::analysis::Spans;
+use crate::selection::ShapeRow;
 use crate::diff::FileStatus;
 use crate::theme::Theme;
 
@@ -255,4 +259,64 @@ pub fn code_line_with_spans(
     }
     let display: SharedString = display.into();
     (display.clone(), StyledText::new(display).with_highlights(highlights), syntax)
+}
+
+/// One row of the token selection, drawn behind the code text laid out by `layout` (put it
+/// before the text in a full-height `relative()` container). Consecutive rows join into one
+/// shape, as in Sublime Text: rounded outer corners, an accent outline only where no
+/// selected row continues it, and a light accent fill.
+pub fn selection_bubble(t: &Theme, layout: TextLayout, shape: ShapeRow) -> impl IntoElement {
+    let (fill_color, border) = (t.accent.opacity(0.16), t.accent.opacity(0.9));
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            // Code is monospace: a column is one character advance.
+            let style = window.text_style();
+            let font_size = style.font_size.to_pixels(window.rem_size());
+            let ts = window.text_system();
+            let advance = ts.advance(ts.resolve_font(&style.font()), font_size, 'm').map(|s| s.width);
+            let cw = advance.unwrap_or(font_size * 0.6);
+            let left = layout.bounds().left();
+            let pad = px(2.);
+            let span = |(a, b): (usize, usize)| (left + cw * a as f32 - pad, left + cw * b as f32 + pad);
+            let (x0, x1) = span(shape.cols);
+            let (prev, next) = (shape.prev.map(span), shape.next.map(span));
+            let covers = |s: Option<(Pixels, Pixels)>, x: Pixels| s.is_some_and(|(a, b)| a <= x && x <= b);
+            let radius = |joined: bool| if joined { px(0.) } else { px(4.) };
+            let corners = Corners {
+                top_left: radius(covers(prev, x0)),
+                top_right: radius(covers(prev, x1)),
+                bottom_right: radius(covers(next, x1)),
+                bottom_left: radius(covers(next, x0)),
+            };
+            let one = px(1.);
+            let edges = Edges {
+                top: if prev.is_none() { one } else { px(0.) },
+                right: one,
+                bottom: if next.is_none() { one } else { px(0.) },
+                left: one,
+            };
+            let (top, bottom) = (bounds.top(), bounds.bottom());
+            let rect = Bounds::from_corners(point(x0, top), point(x1, bottom));
+            window.paint_quad(quad(rect, corners, fill_color, edges, border, BorderStyle::Solid));
+            // Outline where this row sticks out past its neighbour.
+            let mut line = |a: Pixels, b: Pixels, y: Pixels| {
+                if b > a {
+                    window.paint_quad(fill(Bounds::new(point(a, y), size(b - a, one)), border));
+                }
+            };
+            if let Some((p0, p1)) = prev {
+                line(x0, p0.min(x1), top);
+                line(p1.max(x0), x1, top);
+            }
+            if let Some((n0, n1)) = next {
+                line(x0, n0.min(x1), bottom - one);
+                line(n1.max(x0), x1, bottom - one);
+            }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
 }
